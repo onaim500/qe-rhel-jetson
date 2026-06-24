@@ -25,3 +25,4 @@ jumpstarter-driver-pyserial>=0.1.0
 jumpstarter-driver-ustreamer>=0.1.0
 jumpstarter-driver-dutlink>=0.1.0
 jumpstarter_driver_ssh>=0.1.0
+jumpstarter-driver-snmp>=0.1.0

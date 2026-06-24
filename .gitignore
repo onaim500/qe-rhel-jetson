@@ -24,6 +24,7 @@ beaker/ansible/vars/secrets.yml
 # Claude 
 .claude/
 CLAUDE.md
+.planning/
 
 # Device logs (collected at test teardown)
 device_logs/

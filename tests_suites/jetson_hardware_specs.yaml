@@ -12,11 +12,11 @@
 # -----------------------------------------------------------------------------
 _target_versions:
 
-  "6.2.2":
-    rhel_version: "9.8"
-    l4t_version: "36.5.0"
-    uefi_firmware_version: "36.5.1"
-    kernel_version: "5.14.0-687.10.1"
+  "7.2.0":
+    rhel_version: "10.2"
+    l4t_version: "39.2.0"
+    uefi_firmware_version: "39.2.0"
+    kernel_version: "6.12.0-211.20.1"
 
 # -----------------------------------------------------------------------------
 # Shared templates (anchors for merge; not used as match keys)

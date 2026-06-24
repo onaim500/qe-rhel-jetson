@@ -126,7 +126,7 @@ The wrapper automates: power cycle → enable SSH → growpart → run pytest.
 ```bash
 cd qe-rhel-jetson
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 
 jmp get leases --client $USER     # copy your lease name
 jmp shell --lease <LEASE_NAME> -- python jumpstarter/wrapper.py pytest tests_suites/
@@ -134,9 +134,12 @@ jmp shell --lease <LEASE_NAME> -- python jumpstarter/wrapper.py pytest tests_sui
 *If no PXE menu appears during the running* , stop and run the following command
 
 ```bash
-j storage dut # witch storage to the Jetson so it can boot from it
-j power cycle # power on the device
-j serial start-console # Verify boot : 
+j power off
+#Wait 5 seconds, then:
+j storage dut
+j power on
+#Wait ~90 seconds, then:
+j serial start-console
 # -> IF "grub>" appears write exit to force rebooting 
 # -> IF stuck try press ENTER , if "login:" showed up everyting work
 # -> for exit: Ctrl+B x3
@@ -155,8 +158,11 @@ exit    # from the Jumpstarter shell
 In the Jumpstarter shell:
 
 ```bash
+j power off
+#Wait 5 seconds, then:
 j storage dut # witch storage to the Jetson so it can boot from it
-j power cycle # power on the device
+j power on
+#Wait ~90 seconds, then:
 j serial start-console # verify boot (exit: Ctrl+B x3)
 # On the console's machine itself
 # login via root, for password- what you configured in config.toml

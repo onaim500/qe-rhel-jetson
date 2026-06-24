@@ -68,6 +68,7 @@ BOOTC_VERSION: Optional[Union[float, str]] = None  # str if X.Y.Z, float if X.Y
 BOOTC_IMAGE_VERSION: Optional[Union[str]] = None
 BOOTC_IMAGE_URL: Optional[str] = None
 IS_STAGE_BUILD: Optional[bool] = None
+IS_GUI_BUILD: Optional[bool] = None
 SECURE_BOOT_STATE: Optional[str] = None
 
 if JETSON_KEY_PATH: # key path provided, use key-based authentication
@@ -246,6 +247,8 @@ def hardware_info_session(request):
     BOOTC_IMAGE_VERSION = info.get("bootc_image_version")
     BOOTC_IMAGE_URL = info.get("bootc_image_url")
     IS_STAGE_BUILD = "stage" in (BOOTC_IMAGE_URL or "").lower()
+    global IS_GUI_BUILD
+    IS_GUI_BUILD = "gui" in (BOOTC_IMAGE_URL or "").lower()
     SECURE_BOOT_STATE = info.get("secure_boot_state")
     # Skip entire session if hardware model is not in Testing Matrix (jetson_hardware_specs.yaml)
     if get_hardware_spec(HARDWARE_MODEL_NAME) is None:

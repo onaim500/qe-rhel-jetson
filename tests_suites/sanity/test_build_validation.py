@@ -21,6 +21,8 @@ class TestRCBuildPackages:
         """Stage-only packages must not be present on RC/production builds."""
         if conftest.IS_STAGE_BUILD:
             pytest.skip("Stage build — expecting stage-only packages to be present")
+        if conftest.IS_GUI_BUILD:
+            pytest.skip("GUI build — GUI images install extra packages (xorg, rsync)")
 
         result = ssh.run(f"rpm -q {package}", fail_on_rc=False)
         assert result.exit_status != 0, (
@@ -37,6 +39,8 @@ class TestRootAccess:
         Verifies root has no usable password hash in /etc/shadow."""
         if conftest.IS_STAGE_BUILD:
             pytest.skip("Stage build sets a default root password")
+        if conftest.IS_GUI_BUILD:
+            pytest.skip("GUI build — root password set via config.toml for testing")
 
         result = ssh.run("getent shadow root | cut -d: -f2", fail_on_rc=False)
         assert result.exit_status == 0, f"Failed to read shadow entry: {result.stderr}"
@@ -61,6 +65,8 @@ class TestRootAccess:
             assert status_field == "PS", (
                 f"Stage build should have root password set (PS), got: {status_field}"
             )
+        elif conftest.IS_GUI_BUILD:
+            pytest.skip("GUI build — root password set via config.toml for testing")
         else:
             assert status_field in ("LK", "NP", "L"), (
                 f"RC build should have root password locked, got: {status_field}"
