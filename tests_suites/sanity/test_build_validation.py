@@ -4,7 +4,11 @@ Build validation tests for RC (production) vs stage bootc images.
 RC builds (Containerfile.in) omit stage-only packages and have no root password.
 Stage builds (Containerfile-stage.in) include rsync, xorg-x11-server-Xorg, and
 set a default root password.
+
+Jumpstarter deployments set a root password via config.toml for SSH access,
+so root-password tests are skipped automatically when running through the wrapper.
 """
+import os
 import pytest
 from tests_suites import conftest
 from logging import getLogger
@@ -37,6 +41,8 @@ class TestRootAccess:
         Verifies root has no usable password hash in /etc/shadow."""
         if conftest.IS_STAGE_BUILD:
             pytest.skip("Stage build sets a default root password")
+        if os.environ.get("JUMPSTARTER_IN_USE") == "1":
+            pytest.skip("Jumpstarter deployment — root password set via config.toml for SSH access")
 
         result = ssh.run("getent shadow root | cut -d: -f2", fail_on_rc=False)
         assert result.exit_status == 0, f"Failed to read shadow entry: {result.stderr}"
@@ -61,6 +67,8 @@ class TestRootAccess:
             assert status_field == "PS", (
                 f"Stage build should have root password set (PS), got: {status_field}"
             )
+        elif os.environ.get("JUMPSTARTER_IN_USE") == "1":
+            pytest.skip("Jumpstarter deployment — root password set via config.toml for SSH access")
         else:
             assert status_field in ("LK", "NP", "L"), (
                 f"RC build should have root password locked, got: {status_field}"
