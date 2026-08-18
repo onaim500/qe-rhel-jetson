@@ -11,6 +11,13 @@
 # Note: kernel_version can be overridden at runtime with --target-kernel-version
 # -----------------------------------------------------------------------------
 _target_versions:
+"6.2.3":
+    rhel_version: "9.8"
+    l4t_version: "36.5.2"
+    uefi_firmware_version:
+      - "36.5.2"
+    kernel_version:
+      - "5.14.0-687.39.1"
 
   "6.2.2":
     rhel_version: "9.8"
