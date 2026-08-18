@@ -197,12 +197,14 @@ def _fix_efi_via_serial(p):
     p.expect_exact("WRAPPER_EFI_LIST_OK", timeout=30)
     logger.info("[wrapper] Current EFI entries:\n%s", p.before)
 
-    # Remove ALL OS-related boot entries (Red Hat, RHEL, Bootc, Jumpstarter, shim)
+    # Remove ALL OS-related and PXE/network boot entries
     # Do NOT create any new entries — rely on hardware USB fallback
     # Filter with '^Boot[0-9]' first to exclude BootCurrent/BootOrder info lines
+    # PXE/network entries cause the device to boot from Beaker PXE server
+    # instead of USB, ending up at UEFI Shell
     remove_cmd = (
         "for num in $(efibootmgr | grep '^Boot[0-9]' "
-        "| grep -iE 'Red Hat|RHEL|Bootc|Jumpstarter|shim|redhat' "
+        "| grep -iE 'Red Hat|RHEL|Bootc|Jumpstarter|shim|redhat|PXE|Network|IPv4|IPv6|HTTP|EFI Network' "
         "| awk '{print substr($1,5,4)}'); "
         "do echo \"Removing Boot$num\"; efibootmgr -b $num -B 2>/dev/null; done "
         "&& echo WRAPPER_EFI_REMOVE_OK"
@@ -309,7 +311,7 @@ def _handle_emergency(p):
 
 
 def _wait_for_login(p):
-    """Wait for login: prompt, handling grub>, dutlink, and emergency mode recovery.
+    """Wait for login: prompt, handling grub>, UEFI Shell, PXE GRUB menu, dutlink, and emergency mode.
 
     Returns True if login prompt was reached, False otherwise.
     Raises RuntimeError if emergency mode password login fails.
@@ -317,7 +319,10 @@ def _wait_for_login(p):
     got_login = False
     for attempt in range(3):
         try:
-            idx = p.expect_exact(["login:", "grub>", "Give root password"], timeout=600)
+            idx = p.expect_exact(
+                ["login:", "grub>", "Give root password", "Shell>", "Use the ^ and v keys"],
+                timeout=600,
+            )
             if idx == 0:
                 got_login = True
                 break
@@ -330,13 +335,28 @@ def _wait_for_login(p):
                 if _handle_emergency(p):
                     got_login = True
                     break
+            elif idx == 3:
+                logger.info(
+                    f"\n[wrapper] UEFI Shell detected (attempt {attempt + 1}/3) — "
+                    "PXE or boot order issue. Sending 'exit' to return to boot manager, "
+                    "then will power cycle..."
+                )
+                p.sendline("exit")
+                time.sleep(5)
+            elif idx == 4:
+                logger.info(
+                    f"\n[wrapper] GRUB boot menu detected (attempt {attempt + 1}/3), "
+                    "pressing ENTER to select default entry..."
+                )
+                p.sendline("")
+                time.sleep(10)
         except RuntimeError:
             raise  # don't swallow RuntimeError from _handle_emergency
         except Exception:
             logger.info(f"\n[wrapper] Timeout waiting for login/grub (attempt {attempt + 1}/3), sending ENTER to probe for dutlink shell...")
             p.sendline("")
             try:
-                idx = p.expect_exact(["#>", "login:", "grub>"], timeout=30)
+                idx = p.expect_exact(["#>", "login:", "grub>", "Shell>"], timeout=30)
                 if idx == 0:
                     logger.info("[wrapper] Detected dutlink internal shell (#>), sending 'console' to re-enter serial console...")
                     p.sendline("console")
@@ -348,6 +368,10 @@ def _wait_for_login(p):
                     logger.info("[wrapper] Got grub> after probe, sending 'exit'...")
                     p.sendline("exit")
                     time.sleep(10)
+                elif idx == 3:
+                    logger.info("[wrapper] Got UEFI Shell> after probe, sending 'exit'...")
+                    p.sendline("exit")
+                    time.sleep(5)
             except Exception:
                 logger.info("[wrapper] No recognizable prompt after probe, retrying...")
 
