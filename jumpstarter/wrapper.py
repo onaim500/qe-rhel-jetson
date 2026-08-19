@@ -310,6 +310,40 @@ def _handle_emergency(p):
     return False
 
 
+def _try_efi_shell_boot(p):
+    """Try to boot directly from UEFI Shell by finding BOOTAA64.EFI on USB filesystem.
+
+    When PXE boot hijacks the boot order, the UEFI boot manager keeps looping
+    through PXE. Instead of returning to the boot manager (exit), we boot the
+    USB's EFI bootloader directly from the Shell prompt.
+
+    Returns True if login prompt was reached after booting, False otherwise.
+    """
+    logger.info("[wrapper] Refreshing UEFI device map...")
+    p.sendline("map -r")
+    time.sleep(5)
+
+    for fs in ["FS0", "FS1", "FS2", "FS3", "FS4", "FS5", "FS6", "FS7"]:
+        logger.info("[wrapper] Trying %s:\\EFI\\BOOT\\BOOTAA64.EFI ...", fs)
+        p.sendline(f"{fs}:\\EFI\\BOOT\\BOOTAA64.EFI")
+        try:
+            idx = p.expect_exact(["login:", "Shell>", "is not recognized", "not found",
+                                  "Cannot find", "Give root password"], timeout=60)
+            if idx == 0:
+                logger.info("[wrapper] Booted from %s — got login prompt!", fs)
+                return True
+            elif idx == 5:
+                logger.info("[wrapper] Booted from %s — emergency mode", fs)
+                return True
+            else:
+                logger.info("[wrapper] %s: not bootable (idx=%d), trying next...", fs, idx)
+        except Exception:
+            logger.info("[wrapper] %s: timeout or error, trying next...", fs)
+
+    logger.info("[wrapper] Could not find BOOTAA64.EFI on any filesystem")
+    return False
+
+
 def _wait_for_login(p):
     """Wait for login: prompt, handling grub>, UEFI Shell, PXE GRUB menu, dutlink, and emergency mode.
 
@@ -337,19 +371,42 @@ def _wait_for_login(p):
                     break
             elif idx == 3:
                 logger.info(
-                    f"\n[wrapper] UEFI Shell detected (attempt {attempt + 1}/3) — "
-                    "PXE or boot order issue. Sending 'exit' to return to boot manager, "
-                    "then will power cycle..."
+                    f"\n[wrapper] UEFI Shell detected (attempt {attempt + 1}/3). "
+                    "Waiting 60s for boot to settle, then checking for login..."
                 )
-                p.sendline("exit")
-                time.sleep(5)
-            elif idx == 4:
-                logger.info(
-                    f"\n[wrapper] GRUB boot menu detected (attempt {attempt + 1}/3), "
-                    "pressing ENTER to select default entry..."
-                )
+                time.sleep(60)
                 p.sendline("")
-                time.sleep(10)
+                try:
+                    idx2 = p.expect_exact(["login:", "Shell>", "Give root password"], timeout=10)
+                    if idx2 == 0:
+                        logger.info("[wrapper] Login prompt appeared after wait — device booted!")
+                        got_login = True
+                        break
+                    elif idx2 == 2:
+                        logger.info("[wrapper] Emergency mode after wait")
+                        if _handle_emergency(p):
+                            got_login = True
+                            break
+                    elif idx2 == 1:
+                        logger.info("[wrapper] Still at Shell> — PXE boot order issue. Trying direct EFI boot...")
+                        if _try_efi_shell_boot(p):
+                            got_login = True
+                            break
+                except Exception:
+                    logger.info("[wrapper] No prompt after wait, trying direct EFI boot from Shell...")
+                    p.sendline("")
+                    try:
+                        p.expect_exact("Shell>", timeout=10)
+                        if _try_efi_shell_boot(p):
+                            got_login = True
+                            break
+                    except Exception:
+                        logger.info("[wrapper] Lost Shell> prompt, will retry...")
+            elif idx == 4:
+                logger.info("[wrapper] GRUB boot menu detected, sending ENTER to boot default entry...")
+                p.sendline("")
+                time.sleep(5)
+                continue
         except RuntimeError:
             raise  # don't swallow RuntimeError from _handle_emergency
         except Exception:
@@ -369,9 +426,10 @@ def _wait_for_login(p):
                     p.sendline("exit")
                     time.sleep(10)
                 elif idx == 3:
-                    logger.info("[wrapper] Got UEFI Shell> after probe, sending 'exit'...")
-                    p.sendline("exit")
-                    time.sleep(5)
+                    logger.info("[wrapper] Got Shell> after probe, trying direct EFI boot...")
+                    if _try_efi_shell_boot(p):
+                        got_login = True
+                        break
             except Exception:
                 logger.info("[wrapper] No recognizable prompt after probe, retrying...")
 
