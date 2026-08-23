@@ -1,3 +1,6 @@
+# Default: x86 Triton image (version/plugin check tests only).
+# For Jetson L4T full inference tests, override with:
+#   DEEPSTREAM_IMAGE=nvcr.io/nvidia/deepstream-l4t:<version>
 ARG DEEPSTREAM_IMAGE=nvcr.io/nvidia/deepstream:7.1-triton-multiarch
 FROM ${DEEPSTREAM_IMAGE}
 WORKDIR /opt/nvidia/deepstream/deepstream

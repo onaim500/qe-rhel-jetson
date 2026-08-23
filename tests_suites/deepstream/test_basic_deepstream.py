@@ -100,7 +100,27 @@ class TestDeepStream:
         """Run DeepStream inference pipeline on the bundled sample H264 stream.
         Uses the Primary_Detector (ResNet10) model from DeepStream samples.
         Marked @extra — TRT engine compilation on first run can take several minutes.
-        Run with: pytest --run-extra tests_suites/deepstream/"""
+        Run with: pytest --run-extra tests_suites/deepstream/
+
+        Note: requires a Jetson L4T-compatible DeepStream image.
+        Set DEEPSTREAM_IMAGE=nvcr.io/nvidia/deepstream-l4t:<version> for Jetson devices.
+        """
+        # Detect GPU driver compatibility — triton-multiarch requires NVIDIA driver 560.28+
+        # while Jetson L4T uses a different driver lineage (e.g. 540.x).
+        compat = run_container(ssh, deepstream_image, "echo ok")
+        if "UNAVAILABLE" in (compat.stdout + compat.stderr):
+            pytest.skip(
+                "DeepStream container not compatible with installed NVIDIA driver "
+                "(triton-multiarch requires 560.28+, Jetson L4T uses a different version). "
+                "Set DEEPSTREAM_IMAGE to a Jetson L4T DeepStream image, e.g. "
+                "nvcr.io/nvidia/deepstream-l4t:<version>"
+            )
+
+        # Detect available H264 decoder — nvv4l2decoder is L4T-only, not in triton-multiarch
+        dec_check = run_container(ssh, deepstream_image, "gst-inspect-1.0 nvv4l2decoder")
+        decoder = "nvv4l2decoder" if dec_check.exit_status == 0 else "avdec_h264"
+        logger.info("Using H264 decoder: %s", decoder)
+
         sample_stream = f"{DS_STREAMS}/sample_720p.h264"
         infer_config  = f"{DS_CONFIGS}/config_infer_primary.txt"
 
@@ -108,7 +128,7 @@ class TestDeepStream:
             ssh, deepstream_image,
             f"bash -c 'cd {DS_BASE} && "
             f"gst-launch-1.0 "
-            f"filesrc location={sample_stream} ! h264parse ! nvv4l2decoder ! "
+            f"filesrc location={sample_stream} ! h264parse ! {decoder} ! "
             f"nvstreammux name=mux batch-size=1 width=1280 height=720 "
             f"batched-push-timeout=40000 ! "
             f"nvinfer config-file-path={infer_config} batch-size=1 ! "
@@ -118,8 +138,5 @@ class TestDeepStream:
         assert result.exit_status == 0, (
             f"DeepStream inference pipeline failed: {result.stderr}"
         )
-        output = result.stdout + result.stderr
-        assert "End-Of-Stream" in output or "EOS" in output or result.exit_status == 0, (
-            f"Pipeline did not complete cleanly: {output[-500:]}"
-        )
-        logger.info("DeepStream inference pipeline output tail:\n%s", output[-800:])
+        logger.info("DeepStream inference pipeline output tail:\n%s",
+                    (result.stdout + result.stderr)[-800:])
