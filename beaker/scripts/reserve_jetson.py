@@ -54,7 +54,7 @@ JOB_XML_TEMPLATE = '''<job retention_tag="scratch">
       <repos/>
       <distroRequires>
         <and>
-          <distro_family op="=" value="RedHatEnterpriseLinux9"/>
+          <distro_family op="=" value="{distro_family}"/>
           <distro_variant op="=" value="BaseOS"/>
           <distro_name op="=" value="{distro}"/>
           <distro_arch op="=" value="aarch64"/>
@@ -71,6 +71,65 @@ JOB_XML_TEMPLATE = '''<job retention_tag="scratch">
     </recipe>
   </recipeSet>
 </job>'''
+
+
+def resolve_distro(client: BeakerClient, distro: str) -> str:
+    """Resolve a user-friendly distro name to one Beaker actually has.
+
+    Beaker distro trees use inconsistent naming across RHEL versions:
+      - RHEL 9: "RHEL-9.7.0", "RHEL-9.8.0-updates-20260505.10"
+      - RHEL 10: "RHEL-10.2", "RHEL-10.2-updates-20260713.1"
+
+    This function tries the exact name first, then progressively
+    shorter/simpler variants until one matches.
+    """
+    import ssl
+    import xmlrpc.client
+
+    hub_url = get_hub_url()
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    proxy = xmlrpc.client.ServerProxy(
+        hub_url + "/RPC2", allow_none=True, context=ctx,
+    )
+
+    # Build candidate list from most specific to least specific.
+    # e.g. "RHEL-10.2.0" -> try "RHEL-10.2.0", "RHEL-10.2", then wildcard search
+    candidates = [distro]
+    parts = distro.split("-", 1)
+    if len(parts) == 2:
+        version = parts[1]
+        # Strip trailing .0 -> "RHEL-10.2.0" becomes "RHEL-10.2"
+        if version.count(".") >= 2 and version.endswith(".0"):
+            candidates.append(f"RHEL-{version.rsplit('.', 1)[0]}")
+
+    for name in candidates:
+        try:
+            results = proxy.distros.filter({"name": name})
+            if results:
+                print(f"   ✅ Distro resolved: {name}")
+                return name
+        except Exception:
+            pass
+
+    # Wildcard search: "RHEL-10.2.0" -> search "RHEL-10.2%"
+    base = distro.split("-updates")[0]  # strip "-updates-..." suffix
+    if base.count(".") >= 2 and base.endswith(".0"):
+        base = base.rsplit(".", 1)[0]  # "RHEL-10.2.0" -> "RHEL-10.2"
+    search_pattern = f"{base}%"
+    try:
+        results = proxy.distros.filter({"name": search_pattern})
+        if results:
+            best = results[0]
+            name = best.get("distro_name", best) if isinstance(best, dict) else str(best)
+            print(f"   ✅ Distro resolved via search: {name} (from pattern {search_pattern})")
+            return name
+    except Exception:
+        pass
+
+    print(f"   ⚠️  Could not resolve distro, using as-is: {distro}")
+    return distro
 
 
 def run_ssh_command(host: str, command: str, user: str = "root", timeout: int = 15) -> tuple[bool, str]:
@@ -335,20 +394,6 @@ def main():
     
     args = parser.parse_args()
     
-    # Build job XML
-    target_short = args.target.split(".")[0]
-    job_xml = JOB_XML_TEMPLATE.format(
-        target=args.target,
-        target_short=target_short,
-        distro=args.distro,
-        reserve_seconds=args.hours * 3600,
-    )
-    
-    if args.dry_run:
-        print("=== Job XML (dry run) ===")
-        print(job_xml)
-        return
-
     # ---- Beaker phase (best-effort) ----
     hub_url = os.environ.get("BEAKER_HUB_URL", "")
     beaker_ok = False
@@ -358,6 +403,27 @@ def main():
         hub_url = get_hub_url()
         print(f"🔗 Connecting to Beaker...")
         client = get_beaker_client()
+
+        # Resolve distro name against Beaker's catalogue
+        print(f"🔍 Resolving distro: {args.distro}")
+        resolved_distro = resolve_distro(client, args.distro)
+
+        # Build job XML
+        target_short = args.target.split(".")[0]
+        major = resolved_distro.split("-")[1].split(".")[0] if "-" in resolved_distro else "9"
+        distro_family = f"RedHatEnterpriseLinux{major}"
+        job_xml = JOB_XML_TEMPLATE.format(
+            target=args.target,
+            target_short=target_short,
+            distro=resolved_distro,
+            distro_family=distro_family,
+            reserve_seconds=args.hours * 3600,
+        )
+
+        if args.dry_run:
+            print("=== Job XML (dry run) ===")
+            print(job_xml)
+            return
 
         user = client.whoami()
         print(f"✅ Authenticated as: {user}")

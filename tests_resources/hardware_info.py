@@ -87,10 +87,7 @@ def get_tegra_release(ssh) -> str:
 def get_l4t_version(ssh) -> Optional[Union[float, str]]:
     """Return L4T version from /etc/nv_tegra_release (e.g. '36.5.0').
     Returns str for X.Y.Z, float for X.Y, or None."""
-    lines = get_tegra_release(ssh).splitlines()
-    if not lines:
-        return None
-    jetpack_raw = lines[0]
+    jetpack_raw = get_tegra_release(ssh).splitlines()[0]
     if not jetpack_raw:
         return None
 
@@ -119,11 +116,11 @@ def get_l4t_version(ssh) -> Optional[Union[float, str]]:
 
 
 def get_jetpack_userspace_version(ssh) -> Optional[str]:
-    """Return JetPack userspace RPM version (e.g. '6.2.2' or '7.2') from nvidia-jetpack-*-core RPM."""
+    """Return JetPack userspace RPM version (e.g. '6.2.2') from nvidia-jetpack-*-core RPM."""
     rpm_output = _run(ssh, "rpm -qa | grep 'nvidia-jetpack.*core'")
     if not rpm_output:
         return None
-    match = re.search(r"core-(\d+\.\d+(?:\.\d+)?)", rpm_output)
+    match = re.search(r"core-(\d+\.\d+\.\d+)", rpm_output)
     return match.group(1) if match else None
 
 
@@ -132,11 +129,11 @@ get_jetpack_version = get_jetpack_userspace_version
 
 
 def get_jetpack_kmod_version(ssh) -> Optional[str]:
-    """Return JetPack kmod RPM version (e.g. '6.2.2' or '7.2') from nvidia-jetpack-*-kmod RPM."""
+    """Return JetPack kmod RPM version (e.g. '6.2.2') from nvidia-jetpack-*-kmod RPM."""
     rpm_output = _run(ssh, "rpm -qa | grep 'nvidia-jetpack.*kmod'")
     if not rpm_output:
         return None
-    match = re.search(r"kmod-(\d+\.\d+(?:\.\d+)?)", rpm_output)
+    match = re.search(r"kmod-(\d+\.\d+\.\d+)", rpm_output)
     return match.group(1) if match else None
 
 
@@ -147,21 +144,18 @@ def get_all_jetpack_rpm_versions(ssh) -> dict[str, str]:
         return {}
     versions = {}
     for line in output.strip().splitlines():
-        match = re.search(r"nvidia-jetpack-for-rhel-[\d.]+-([a-z][a-z0-9-]*)-(\d+\.\d+(?:\.\d+)?)", line)
+        match = re.search(r"nvidia-jetpack-for-rhel-[\d.]+-(.+?)-(\d+\.\d+\.\d+)", line)
         if match:
             versions[match.group(1)] = match.group(2)
     return versions
 
 
-def compare_versions(actual: Optional[Union[float, str]], target) -> bool:
+def compare_versions(actual: Optional[Union[float, str]], target: Optional[str]) -> bool:
     """Exact version comparison. Converts both to strings.
     For kernel versions (target contains '-'): uses prefix match.
-    If target is a list, returns True if actual matches any entry.
     Returns True if they match."""
     if actual is None or target is None:
         return False
-    if isinstance(target, list):
-        return any(compare_versions(actual, t) for t in target)
     actual_str, target_str = str(actual), str(target)
     if "-" in target_str:
         return actual_str.startswith(target_str)
@@ -317,3 +311,4 @@ def collect(ssh) -> dict[str, Any]:
         "bootc_image_version": bootc["bootc_image_version"],
         "secure_boot_state": secure_boot_state,
     }
+    
