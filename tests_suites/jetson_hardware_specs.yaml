@@ -12,25 +12,11 @@
 # -----------------------------------------------------------------------------
 _target_versions:
 
-  "6.2.2":
-    rhel_version: "9.8"
-    l4t_version: "36.5.0"
-    uefi_firmware_version:
-      - "36.5.0"
-      - "36.5.1"
-      - "36.5.2"
-    kernel_version:
-      - "5.14.0-687.10.1"
-      - "5.14.0-687.12.1"
-      - "5.14.0-687.31.1"
-
-  "7.2":
+  "7.2.0":
     rhel_version: "10.2"
     l4t_version: "39.2.0"
-    uefi_firmware_version:
-      - "39.2.0"
-    kernel_version:
-      - "6.12.0-211.40.1"
+    uefi_firmware_version: "39.2.0"
+    kernel_version: "6.12.0-211.20.1"
 
 # -----------------------------------------------------------------------------
 # Shared templates (anchors for merge; not used as match keys)
@@ -42,34 +28,22 @@ _templates:
     vic: { supported: true }
     video_enc: { supported: true }
     video_dec: { supported: true }
-    i2c: { min_buses: 4 }
-    spi: { supported: true }
-    isp: { supported: true, vi_channels: 16, max_resolution: "64MP" }
   nano: &nano_common
     dla: { supported: false }
     pva: { supported: false }
     vic: { supported: true }
     video_enc: { supported: false }
     video_dec: { supported: true }
-    i2c: { min_buses: 2 }
-    spi: { supported: true }
-    isp: { supported: true, vi_channels: 2, max_resolution: "64MP" }
   agx: &agx_common
     dla: { supported: true, cores: 2 }
     pva: { supported: true }
     vic: { supported: true }
     video_enc: { supported: true }
     video_dec: { supported: true }
-    i2c: { min_buses: 4 }
-    spi: { supported: true }
-    isp: { supported: true, vi_channels: 16, max_resolution: "64MP" }
   orin_nx: &orin_nx_common
     dla: { supported: true, cores: 2 }
     pva: { supported: true }
     vic: { supported: true }
-    i2c: { min_buses: 2 }
-    spi: { supported: true }
-    isp: { supported: true, vi_channels: 8, max_resolution: "64MP" }
     tools: { power_modes: ["10W", "15W", "25W", "40W"] }
     video_enc: { supported: true }
     video_dec: { supported: true }
