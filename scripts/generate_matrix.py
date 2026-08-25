@@ -27,11 +27,12 @@ KNOWN_TESTS = {
     "Bootc switch", "Secure Boot",
     "CUDA", "DLA", "PVA (VPI)", "PVA",
     "VIC", "Multimedia", "Video Enc/Dec",
+    "DeepStream",
     "USBs", "PCIs", "CAN bus", "CSI camera",
     "SPI/I2C", "GPIO", "GPIOs", "PWM",
     "Display", "Text-based display", "GUI display",
     "Ethernet", "Nvidia CLI tools", "Kernel Modules",
-    "RC/Stage build", "RTC",
+    "RC/Stage build", "RTC", "SC7 Suspend", "ISP",
 }
 
 TEST_ALIASES = {
@@ -49,6 +50,7 @@ TEST_GROUPS = {
     "PVA (VPI)":          "Accelerators",
     "VIC":                "Media",
     "Multimedia":         "Media",
+    "DeepStream":         "Accelerators",
     "USBs":               "I/O",
     "PCIs":               "I/O",
     "CAN bus":            "I/O",
@@ -63,6 +65,8 @@ TEST_GROUPS = {
     "Kernel Modules":     "System",
     "RC/Stage build":     "System",
     "RTC":                "System",
+    "SC7 Suspend":        "Power Management",
+    "ISP":                "Media",
 }
 
 TEST_ICONS = {}
@@ -279,10 +283,11 @@ def load_ci_results(ci_json_path, default_version="9.7"):
 # Ordered list of all known tests for CI-only rendering
 _TEST_ORDER = [
     "Bootc switch", "Secure Boot",
-    "CUDA", "DLA", "PVA (VPI)", "VIC", "Multimedia",
+    "CUDA", "DLA", "PVA (VPI)", "VIC", "Multimedia", "DeepStream",
     "USBs", "PCIs", "CAN bus", "CSI camera", "SPI/I2C", "GPIO", "PWM",
     "Display", "Text-based display", "GUI display",
     "Ethernet", "Nvidia CLI tools", "Kernel Modules", "RC/Stage build", "RTC",
+    "SC7 Suspend", "ISP",
 ]
 
 
