@@ -235,6 +235,9 @@ def hardware_info_session(request):
     global SECURE_BOOT_STATE
     RHEL_VERSION = info.get("rhel_version")
     L4T_VERSION = info.get("l4t_version")
+    if L4T_VERSION:
+        from tests_resources.container_ops import set_l4t_image_from_version
+        set_l4t_image_from_version(str(L4T_VERSION))
     JETPACK_VERSION = info.get("jetpack_version")
     JETPACK_KMOD_VERSION = info.get("jetpack_kmod_version")
     FIRMWARE_VERSION = info.get("firmware_version")
