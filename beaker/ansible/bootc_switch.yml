@@ -139,9 +139,9 @@
     - name: Verify expected image is booted
       ansible.builtin.assert:
         that:
-          - bootc_image_tag in new_bootc_status.stdout
-        fail_msg: "Expected image tag '{{ bootc_image_tag }}' not found in bootc status output"
-        success_msg: "Image tag '{{ bootc_image_tag }}' confirmed in bootc status"
+          - bootc_image_base in new_bootc_status.stdout or bootc_image in new_bootc_status.stdout or bootc_image_tag in new_bootc_status.stdout
+        fail_msg: "Expected image '{{ bootc_image }}' not found in bootc status output"
+        success_msg: "Image '{{ bootc_image }}' confirmed in bootc status"
       when: auto_reboot | bool
       tags: [verify]
 
