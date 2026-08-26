@@ -1,27 +1,52 @@
-name: Generate Test Matrix Dashboard
+name: Update Test Matrix Dashboard
 
 on:
+  # Cron: run after each Prow periodic job to give it time to finish
+  schedule:
+    - cron: '30 10 * * 1'  # e2e-full  — Monday    10:30 UTC (job runs 08:00)
+    - cron: '30 14 * * 6'  # e2e-bootc — Saturday  14:30 UTC (job runs 12:00)
+  # Also regenerate on push to this branch when matrix scripts change
   push:
     branches: [main, rhel-9.8]
     paths:
       - "matrix_data/**"
       - "scripts/generate_matrix.py"
       - "scripts/fetch_ci_data.py"
+  # Regenerate after a Beaker CI run completes
   workflow_run:
     workflows: ["Beaker Jetson Testing"]
     types: [completed]
+  # Manual trigger
   workflow_dispatch:
+    inputs:
+      job_name:
+        description: 'Prow periodic job to fetch (leave blank to skip GCS fetch)'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - periodic-ci-rh-ecosystem-edge-qe-rhel-jetson-rhel-9.8-e2e-full
+          - periodic-ci-rh-ecosystem-edge-qe-rhel-jetson-rhel-9.8-e2e-bootc
 
 permissions:
   contents: read
   pages: write
   id-token: write
 
+env:
+  GCS_BUCKET: test-platform-results
+  GCS_BASE: gs://test-platform-results/logs
+
 jobs:
-  generate:
+  fetch-and-generate:
+    name: Fetch Results & Generate Dashboard
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
           ref: rhel-9.8
 
@@ -30,6 +55,113 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      #========================================================================
+      # Step 1: Fetch Prow periodic job results from GCS (cron / manual only)
+      #========================================================================
+      - name: Resolve Prow job name
+        id: job
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            JOB="${{ github.event.inputs.job_name }}"
+          elif [ "${{ github.event_name }}" == "schedule" ]; then
+            DOW=$(date -u +%u)  # 1=Mon 6=Sat
+            case "$DOW" in
+              1) JOB="periodic-ci-rh-ecosystem-edge-qe-rhel-jetson-rhel-9.8-e2e-full" ;;
+              6) JOB="periodic-ci-rh-ecosystem-edge-qe-rhel-jetson-rhel-9.8-e2e-bootc" ;;
+              *) JOB="" ;;
+            esac
+          else
+            JOB=""
+          fi
+          echo "name=$JOB" >> $GITHUB_OUTPUT
+          [ -n "$JOB" ] && echo "fetch=true" >> $GITHUB_OUTPUT || echo "fetch=false" >> $GITHUB_OUTPUT
+          echo "Prow job to fetch: ${JOB:-none}"
+
+      - name: Install gsutil
+        if: steps.job.outputs.fetch == 'true'
+        run: |
+          curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --install-dir=/opt/google-cloud-sdk
+          echo "/opt/google-cloud-sdk/google-cloud-sdk/bin" >> $GITHUB_PATH
+
+      - name: Find latest Prow build
+        id: build
+        if: steps.job.outputs.fetch == 'true'
+        run: |
+          JOB="${{ steps.job.outputs.name }}"
+          GCS_JOB_PATH="${{ env.GCS_BASE }}/${JOB}"
+          BUILD_ID=$(gsutil ls "${GCS_JOB_PATH}/" 2>/dev/null \
+            | grep -oE '[0-9]{19}' | sort -n | tail -1)
+          if [ -z "$BUILD_ID" ]; then
+            echo "No builds found for ${JOB}"
+            exit 1
+          fi
+          echo "id=${BUILD_ID}" >> $GITHUB_OUTPUT
+          echo "path=${GCS_JOB_PATH}/${BUILD_ID}" >> $GITHUB_OUTPUT
+          echo "Latest build: ${BUILD_ID}"
+
+      - name: Wait for Prow build to finish
+        if: steps.job.outputs.fetch == 'true'
+        run: |
+          BUILD_PATH="${{ steps.build.outputs.path }}"
+          for i in $(seq 1 30); do
+            if gsutil ls "${BUILD_PATH}/finished.json" &>/dev/null; then
+              echo "Build finished."; break
+            fi
+            echo "  Not finished yet, waiting 60s... ($i/30)"
+            sleep 60
+          done
+          if ! gsutil ls "${BUILD_PATH}/finished.json" &>/dev/null; then
+            echo "Timed out waiting for build to finish"; exit 1
+          fi
+
+      - name: Download Prow artifacts
+        if: steps.job.outputs.fetch == 'true'
+        run: |
+          BUILD_PATH="${{ steps.build.outputs.path }}"
+          mkdir -p prow-results
+          gsutil cp "${BUILD_PATH}/finished.json" prow-results/
+          TEST_STEP=$(echo "${{ steps.job.outputs.name }}" | grep -oP 'e2e-\w+')
+          JUNIT_PATH="${BUILD_PATH}/artifacts/${TEST_STEP}/qe-rhel-jetson-pytest/artifacts/junit.xml"
+          gsutil cp "${JUNIT_PATH}" prow-results/junit.xml 2>/dev/null || \
+            gsutil cp "${BUILD_PATH}/artifacts/${TEST_STEP}/qe-rhel-jetson-pytest/junit.xml" prow-results/junit.xml 2>/dev/null || \
+            echo "junit.xml not found, skipping"
+          gsutil cp "${BUILD_PATH}/artifacts/${TEST_STEP}/qe-rhel-jetson-pytest/build-log.txt" prow-results/build-log.txt 2>/dev/null || true
+          ls -lh prow-results/
+
+      - name: Parse Prow results
+        id: prow
+        if: steps.job.outputs.fetch == 'true'
+        run: |
+          PASSED=$(python3 -c "
+          import json
+          with open('prow-results/finished.json') as f:
+              d = json.load(f)
+          print('true' if d.get('passed') else 'false')
+          " 2>/dev/null || echo "false")
+          RESULT=$(python3 -c "
+          import json
+          with open('prow-results/finished.json') as f:
+              d = json.load(f)
+          print(d.get('result', 'unknown'))
+          " 2>/dev/null || echo "unknown")
+          echo "passed=${PASSED}" >> $GITHUB_OUTPUT
+          echo "result=${RESULT}" >> $GITHUB_OUTPUT
+          echo "Prow result: ${RESULT}"
+
+      - name: Upload Prow raw artifacts
+        uses: actions/upload-artifact@v4
+        if: steps.job.outputs.fetch == 'true'
+        with:
+          name: prow-results-${{ steps.job.outputs.name }}-${{ steps.build.outputs.id }}
+          path: prow-results/
+          retention-days: 30
+
+      #========================================================================
+      # Step 2: Fetch PR-triggered CI results and generate dashboard
+      #========================================================================
       - name: Fetch CI results from Prow/GCS
         run: |
           python scripts/fetch_ci_data.py \
@@ -48,8 +180,35 @@ jobs:
         with:
           path: docs/
 
+      #========================================================================
+      # Step 3: Job summary
+      #========================================================================
+      - name: Job Summary
+        if: always()
+        run: |
+          FETCH="${{ steps.job.outputs.fetch }}"
+          if [ "$FETCH" == "true" ]; then
+            JOB="${{ steps.job.outputs.name }}"
+            BUILD_ID="${{ steps.build.outputs.id }}"
+            RESULT="${{ steps.prow.outputs.result }}"
+            ICON=$([[ "${{ steps.prow.outputs.passed }}" == "true" ]] && echo "✅" || echo "❌")
+            cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## ${ICON} Prow Periodic Job: ${RESULT}
+
+          | Field | Value |
+          |-------|-------|
+          | **Job** | \`${JOB}\` |
+          | **Build ID** | \`${BUILD_ID}\` |
+          | **Result** | **${RESULT}** |
+          | **Prow Link** | [View on Prow](https://prow.ci.openshift.org/view/gs/${{ env.GCS_BUCKET }}/logs/${JOB}/${BUILD_ID}) |
+
+          EOF
+          fi
+          echo "## 📊 Matrix dashboard regenerated" >> $GITHUB_STEP_SUMMARY
+
   deploy-pages:
-    needs: generate
+    name: Deploy to GitHub Pages
+    needs: fetch-and-generate
     runs-on: ubuntu-latest
     environment:
       name: github-pages
