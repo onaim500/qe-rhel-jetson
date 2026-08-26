@@ -2,7 +2,7 @@ name: Generate Test Matrix Dashboard
 
 on:
   push:
-    branches: [main]
+    branches: [main, rhel-9.8]
     paths:
       - "matrix_data/**"
       - "scripts/generate_matrix.py"
@@ -22,6 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: rhel-9.8
 
       - name: Set up Python
         uses: actions/setup-python@v5
