@@ -2,22 +2,20 @@ name: Fetch Prow Periodic Results
 
 on:
   # Run a bit after each Prow cron to give jobs time to finish
+  # rhel-9.8: e2e-full Monday 08:00 UTC, e2e-bootc Saturday 12:00 UTC
+  # rhel-10.2: add entries here when hardware is available
   schedule:
-    - cron: '30 9 * * 1'   # sanity   - Monday    09:30 UTC  (job runs 08:00)
-    - cron: '30 9 * * 3'   # hardware - Wednesday  09:30 UTC  (job runs 08:00)
-    - cron: '30 9 * * 5'   # peripherals - Friday  09:30 UTC  (job runs 08:00)
-    - cron: '30 13 * * 6'  # bootc    - Saturday  13:30 UTC  (job runs 12:00)
+    - cron: '30 10 * * 1'   # rhel-9.8 e2e-full  - Monday   10:30 UTC  (job runs 08:00)
+    - cron: '30 14 * * 6'   # rhel-9.8 e2e-bootc - Saturday 14:30 UTC  (job runs 12:00)
   workflow_dispatch:
     inputs:
       job_name:
         description: 'Prow job name to fetch'
         required: true
-        default: 'periodic-ci-rh-ecosystem-edge-qe-rhel-jetson-rhel-9.8-e2e-sanity'
+        default: 'periodic-ci-rh-ecosystem-edge-qe-rhel-jetson-rhel-9.8-e2e-full'
         type: choice
         options:
-          - periodic-ci-rh-ecosystem-edge-qe-rhel-jetson-rhel-9.8-e2e-sanity
-          - periodic-ci-rh-ecosystem-edge-qe-rhel-jetson-rhel-9.8-e2e-hardware
-          - periodic-ci-rh-ecosystem-edge-qe-rhel-jetson-rhel-9.8-e2e-peripherals
+          - periodic-ci-rh-ecosystem-edge-qe-rhel-jetson-rhel-9.8-e2e-full
           - periodic-ci-rh-ecosystem-edge-qe-rhel-jetson-rhel-9.8-e2e-bootc
 
 env:
@@ -46,11 +44,9 @@ jobs:
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             JOB="${{ github.event.inputs.job_name }}"
           else
-            DOW=$(date -u +%u)  # 1=Mon 3=Wed 5=Fri 6=Sat
+            DOW=$(date -u +%u)  # 1=Mon 6=Sat
             case "$DOW" in
-              1) JOB="periodic-ci-rh-ecosystem-edge-qe-rhel-jetson-rhel-9.8-e2e-sanity" ;;
-              3) JOB="periodic-ci-rh-ecosystem-edge-qe-rhel-jetson-rhel-9.8-e2e-hardware" ;;
-              5) JOB="periodic-ci-rh-ecosystem-edge-qe-rhel-jetson-rhel-9.8-e2e-peripherals" ;;
+              1) JOB="periodic-ci-rh-ecosystem-edge-qe-rhel-jetson-rhel-9.8-e2e-full" ;;
               6) JOB="periodic-ci-rh-ecosystem-edge-qe-rhel-jetson-rhel-9.8-e2e-bootc" ;;
               *) echo "No job mapped for day $DOW"; exit 1 ;;
             esac
