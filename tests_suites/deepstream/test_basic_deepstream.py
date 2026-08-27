@@ -95,12 +95,10 @@ class TestDeepStream:
             f"nvstreammux pipeline failed: {result.stderr}"
         )
 
-    @pytest.mark.extra
     def test_deepstream_sample_inference(self, ssh, deepstream_image):
         """Run DeepStream inference pipeline on the bundled sample H264 stream.
         Uses the Primary_Detector (ResNet10) model from DeepStream samples.
-        Marked @extra — TRT engine compilation on first run can take several minutes.
-        Run with: pytest --run-extra tests_suites/deepstream/
+        Note: TRT engine compilation on first run can take several minutes.
 
         Note: requires a Jetson L4T-compatible DeepStream image.
         Set DEEPSTREAM_IMAGE=nvcr.io/nvidia/deepstream-l4t:<version> for Jetson devices.
