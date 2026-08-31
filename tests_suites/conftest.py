@@ -342,11 +342,16 @@ def refresh_hardware_info_globals(ssh):
     )
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="session")
 def l4t_image_pulled(hardware_info_session):
     """Pre-pull L4T JetPack container image once per session.
-    Podman caches the base layer — subsequent podman build FROM this image
-    only downloads the test-specific layers on top."""
+
+    Not autouse: SC7/RTC/and other non-container suites must not depend on
+    nvcr.io. Suites that build FROM l4t-jetpack request this fixture.
+
+    The device L4T version is not always a published NGC tag (e.g. r36.5.2).
+    A missing manifest used to RuntimeError the entire pytest session.
+    """
     from tests_resources.container_ops import L4T_JETPACK_IMAGE
     with SSHConnection(
         JETSON_HOST,
@@ -356,7 +361,18 @@ def l4t_image_pulled(hardware_info_session):
         JETSON_TIMEOUT,
         key_filename=key_path,
     ) as ssh:
-        ssh.sudo(f"podman pull {L4T_JETPACK_IMAGE}", timeout=900)
+        exists = ssh.sudo(f"podman image exists {L4T_JETPACK_IMAGE}", fail_on_rc=False)
+        if exists.exit_status == 0:
+            logger.info("[Setup] L4T image already present: %s", L4T_JETPACK_IMAGE)
+        else:
+            result = ssh.sudo(
+                f"podman pull {L4T_JETPACK_IMAGE}", timeout=900, fail_on_rc=False
+            )
+            if result.exit_status != 0:
+                pytest.skip(
+                    f"Failed to pull {L4T_JETPACK_IMAGE} (rc={result.exit_status}): "
+                    f"{(result.stderr or result.stdout).strip()[:500]}"
+                )
     yield
 
 @pytest.fixture(scope="session", autouse=True)

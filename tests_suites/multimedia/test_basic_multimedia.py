@@ -20,7 +20,7 @@ class TestMultimedia:
     """Test multimedia functionality on Jetson devices."""
 
     @pytest.fixture(scope="class")
-    def l4t_mmapi_image(self, ssh):
+    def l4t_mmapi_image(self, ssh, l4t_image_pulled):
         """Build L4T MMAPI image once per class, clean up after."""
         tag = f"l4t-mmapi-tests:{L4T_JETPACK_IMAGE.split(':')[1]}"
         build_container_image(

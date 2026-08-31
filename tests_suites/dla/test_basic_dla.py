@@ -22,7 +22,7 @@ class TestDLA:
     """Test DLA functionality on Jetson devices."""
 
     @pytest.fixture(scope="class")
-    def l4t_tensorrt_image(self, ssh):
+    def l4t_tensorrt_image(self, ssh, l4t_image_pulled):
         """Build L4T TensorRT image once per class, clean up after."""
         tag = f"l4t-tensorrt-tests:{L4T_JETPACK_IMAGE.split(':')[1]}"
         build_container_image(ssh, FILE / "Dockerfile.l4t_tensorrt", tag, suite_name="dla")
