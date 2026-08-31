@@ -27,7 +27,7 @@ class TestCUDA:
     """Test CUDA functionality on Jetson devices."""
 
     @pytest.fixture(scope="class")
-    def l4t_cuda_image(self, ssh):
+    def l4t_cuda_image(self, ssh, l4t_image_pulled):
         """Build L4T CUDA samples image once per class, clean up after."""
         tag = f"l4t-cuda-tests:{L4T_JETPACK_IMAGE.split(':')[1]}-{CUDA_SAMPLES_VERSION}"
         build_container_image(
