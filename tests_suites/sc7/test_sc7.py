@@ -345,7 +345,6 @@ class TestSC7Support:
         logger.info("Wakeup sources: %s", result.stdout.strip() or "(none listed)")
 
 
-@pytest.mark.extra
 class TestSC7Suspend:
     """Trigger a full SC7 suspend/resume cycle and verify clean resume."""
 
@@ -437,7 +436,6 @@ class TestSC7Suspend:
             resumed.close()
 
 
-@pytest.mark.extra
 class TestSC7Recovery:
     """Verify hardware and services are healthy after SC7 resume."""
 
