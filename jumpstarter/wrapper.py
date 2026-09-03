@@ -601,4 +601,8 @@ with env() as client:
                   f"JETSON_PORT={os.environ['JETSON_PORT']} "
                   f"JETSON_USERNAME={os.environ.get('JETSON_USERNAME')} "
                   f"JETSON_KEY_PATH={os.environ.get('JETSON_KEY_PATH', '(not set)')}")
-            subprocess.run(sys.argv[1:])
+            result = subprocess.run(sys.argv[1:])
+            # Propagate pytest's exit code so CI (Testing Farm / Konflux) sees
+            # real failures. Without this the wrapper always exits 0 and every
+            # run is reported PASSED regardless of failed/errored tests.
+            sys.exit(result.returncode)
