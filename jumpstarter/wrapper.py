@@ -268,6 +268,12 @@ def _pin_usb_boot_first(p):
     logger.info("[wrapper] Pinning USB boot entry first + pruning stale EFI entries...")
     pin_cmd = (
         "dmesg -n 1; "
+        # Build the marker from a shell var so the literal 'WRAPPER_PIN_OK'
+        # appears only in the command OUTPUT, never in its echo. Otherwise
+        # p.expect_exact() matches the echoed command and returns BEFORE the
+        # command finishes, letting the next sendline interleave with it and
+        # corrupt the following SSH-config step (serial rule).
+        "PMARK=WRAPPER_PIN; "
         "BC=$(efibootmgr | awk '/^BootCurrent:/{print $2}'); "
         "if [ -n \"$BC\" ]; then "
         # grep -E '^Boot[0-9A-Fa-f]{4}' (require 4 hex) so we match real boot
@@ -282,8 +288,8 @@ def _pin_usb_boot_first(p):
         "O=$(efibootmgr | awk '/^BootOrder:/{print $2}'); "
         "R=$(echo \"$O\" | sed \"s/$BC,//g; s/,$BC//g; s/^$BC$//\"); "
         "efibootmgr -o \"$BC${R:+,$R}\" >/dev/null 2>&1; "
-        "echo WRAPPER_PIN_OK BC=$BC; "
-        "else echo WRAPPER_PIN_SKIP_NO_BOOTCURRENT; fi"
+        "echo ${PMARK}_OK BC=$BC; "
+        "else echo ${PMARK}_SKIP_NO_BOOTCURRENT; fi"
     )
     p.sendline(pin_cmd)
     try:
@@ -613,6 +619,11 @@ with env() as client:
 
                         p.sendline(
                             "echo 'PermitRootLogin yes' > /etc/ssh/sshd_config.d/01-permitrootlogin.conf"
+                            # Also enable password auth: reaching login proves the
+                            # root password is valid, but the image may ship
+                            # PasswordAuthentication no, which blocks the paramiko
+                            # root-password SSH used by the growpart/prepull steps.
+                            " && echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config.d/01-permitrootlogin.conf"
                             " && chmod 644 /etc/ssh/sshd_config.d/01-permitrootlogin.conf"
                             " && systemctl restart sshd"
                             " && echo WRAPPER_SSH_CONFIG_OK"
