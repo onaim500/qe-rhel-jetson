@@ -6,6 +6,7 @@ import sys
 import os
 import re
 import yaml
+import contextlib
 import subprocess
 from pathlib import Path
 from logging import getLogger
@@ -238,6 +239,67 @@ def _fix_efi_via_serial(p):
     logger.info("[wrapper] EFI boot fix complete, will re-flash and retry boot from USB")
 
 
+def _pin_usb_boot_first(p):
+    """Make the firmware deterministically boot the flashed USB image on every
+    subsequent power-on (the 'always USB' fix).
+
+    Background (agx-orin-11, see .claude/memory/jumpstarter-errors.md 2026-09-06):
+    every flash appends a new "Red Hat Enterprise Linux" UEFI boot entry and old
+    ones are never cleaned up (80+ stale duplicates observed, all pointing at
+    dead/old UUIDs or the internal eMMC). Which one the firmware puts first in
+    BootOrder varies per flash, so the device intermittently boots the STALE
+    internal eMMC RHEL — which hangs in early kernel init and never reaches
+    login — instead of the freshly flashed USB image. (It also risks filling
+    UEFI NVRAM -> the "Volume Full" boot-loop seen on nx-orin-01.)
+
+    This must be called ONLY once we have a root shell on the correctly-booted
+    USB image. Because the stale eMMC install hangs *before* login, simply
+    reaching a login/root shell guarantees we are on the USB image, so
+    `BootCurrent` is the good USB boot entry. We:
+      1. pin BootCurrent first in BootOrder, and
+      2. delete every other stale RHEL/PXE/Network entry (keeping BootCurrent),
+    so the next boot (bootc firstboot reboots, later test phases, and subsequent
+    runs until the next reflash) is deterministic.
+
+    Assumes the caller is already logged in as root at a shell prompt (`#`).
+    Runs as a SINGLE compound command — multiple dependent sendlines interleave
+    on the shared serial console (console=ttyTCU0).
+    """
+    logger.info("[wrapper] Pinning USB boot entry first + pruning stale EFI entries...")
+    pin_cmd = (
+        "dmesg -n 1; "
+        "BC=$(efibootmgr | awk '/^BootCurrent:/{print $2}'); "
+        "if [ -n \"$BC\" ]; then "
+        # grep -E '^Boot[0-9A-Fa-f]{4}' (require 4 hex) so we match real boot
+        # entries only, NOT the 'BootCurrent:'/'BootOrder:' info lines
+        # ('BootCurrent' -> 'Curr' would otherwise slip through and yield a
+        # bogus 'efibootmgr -b Curr -B'). See serial rules in memory.
+        "for n in $(efibootmgr | grep -E '^Boot[0-9A-Fa-f]{4}' "
+        "| grep -iE 'Red Hat|RHEL|Bootc|shim|redhat|PXE|Network|IPv4|IPv6|HTTP|EFI Network' "
+        "| awk '{print substr($1,5,4)}'); do "
+        "[ \"$n\" != \"$BC\" ] && efibootmgr -b \"$n\" -B >/dev/null 2>&1; "
+        "done; "
+        "O=$(efibootmgr | awk '/^BootOrder:/{print $2}'); "
+        "R=$(echo \"$O\" | sed \"s/$BC,//g; s/,$BC//g; s/^$BC$//\"); "
+        "efibootmgr -o \"$BC${R:+,$R}\" >/dev/null 2>&1; "
+        "echo WRAPPER_PIN_OK BC=$BC; "
+        "else echo WRAPPER_PIN_SKIP_NO_BOOTCURRENT; fi"
+    )
+    p.sendline(pin_cmd)
+    try:
+        idx = p.expect_exact(
+            ["WRAPPER_PIN_OK", "WRAPPER_PIN_SKIP_NO_BOOTCURRENT"], timeout=60
+        )
+        if idx == 0:
+            logger.info("[wrapper] USB boot entry pinned first; stale EFI entries pruned")
+        else:
+            logger.warning("[wrapper] Could not read BootCurrent — skipped EFI pin (non-fatal)")
+    except Exception:
+        # Non-fatal: the current boot already succeeded; pinning only helps
+        # future boots. Don't fail the run if the serial marker is missed.
+        logger.warning("[wrapper] EFI pin marker not seen — continuing (non-fatal)")
+
+
 def _handle_emergency(p):
     """Handle emergency mode by trying password login + exit, repeating if needed.
 
@@ -437,7 +499,15 @@ def _wait_for_login(p):
 
 
 with env() as client:
-    with client.log_stream():
+    # NOTE: Do NOT wrap this in `client.log_stream()`. log_stream() opens a
+    # second, passive consumer of the serial stream that races the interactive
+    # `client.serial.pexpect()` reader opened below. The serial driver delivers
+    # each byte to only one reader, so log_stream() intermittently swallows boot
+    # output (including the `login:` prompt) before pexpect can match it —
+    # causing _wait_for_login() to time out even though the device booted fine.
+    # pexpect still mirrors live serial to stdout via `p.logfile`, so we lose no
+    # visibility. See .claude/memory/jumpstarter-errors.md (2026-09-06).
+    with contextlib.nullcontext():
 
         # When emergency mode can't be resolved via password+exit, skip storage.dut()
         # on the next attempt so the device boots from NVMe. The wrong OS detection
@@ -533,6 +603,13 @@ with env() as client:
                         p.expect("assword:", timeout=30)
                         p.sendline(PASSWORD)
                         p.expect(r"[#\$]", timeout=30)
+
+                        # Reaching a root shell means we booted the flashed USB
+                        # image (the stale internal eMMC install hangs before
+                        # login), so BootCurrent is the good USB entry. Pin it
+                        # first + prune stale duplicates so future boots are
+                        # deterministic ('always USB'). Non-fatal on failure.
+                        _pin_usb_boot_first(p)
 
                         p.sendline(
                             "echo 'PermitRootLogin yes' > /etc/ssh/sshd_config.d/01-permitrootlogin.conf"
