@@ -31,6 +31,12 @@
     auto_reboot: true
     # Set to false with -e "restore_boot_order=false" to keep bootc first in boot order
     restore_boot_order: true
+    # bootc install mode: "existing-root" (default) or "to-disk"
+    #   existing-root: replaces running OS in-place (ESP+root must be on same device)
+    #   to-disk: wipes target disk and writes fresh bootc image
+    bootc_install_mode: "existing-root"
+    # Target disk for to-disk mode: "nvme", "emmc", "sd", "usb", or explicit path
+    bootc_install_disk: ""
   
   vars_files:
     - vars/secrets.yml  # Contains registry_user and registry_pass (encrypted with ansible-vault)
@@ -133,7 +139,145 @@
       tags: [image]
 
     #=========================================================================
-    # Step 5: Run bootc install to-existing-root
+    # Step 5a: Resolve target disk for to-disk mode
+    #=========================================================================
+    - name: Resolve target disk device
+      ansible.builtin.shell: |
+        case "{{ bootc_install_disk }}" in
+          nvme)  lsblk -dnpo NAME,TYPE | awk '$2=="disk" && $1~/nvme/' | head -1 | awk '{print $1}' ;;
+          emmc)  echo "/dev/mmcblk0" ;;
+          sd)    # SD card: built-in slot (mmcblk1) or USB card reader (sdX)
+                 RESULT=$(lsblk -dnpo NAME,TYPE | awk '$2=="disk" && $1~/mmcblk[1-9]/' | head -1 | awk '{print $1}')
+                 [ -z "$RESULT" ] && RESULT=$(lsblk -dnpo NAME,TYPE | awk '$2=="disk" && $1~/sd[a-z]/' | head -1 | awk '{print $1}')
+                 echo "$RESULT" ;;
+          usb)   lsblk -dnpo NAME,TYPE | awk '$2=="disk" && $1~/sd[a-z]/' | head -1 | awk '{print $1}' ;;
+          /dev/*) echo "{{ bootc_install_disk }}" ;;
+          *)     echo "" ;;
+        esac
+      register: disk_resolve_result
+      changed_when: false
+      when: bootc_install_mode == "to-disk"
+      tags: [install]
+
+    - name: Set resolved disk fact
+      ansible.builtin.set_fact:
+        resolved_disk: "{{ disk_resolve_result.stdout | trim }}"
+      when: bootc_install_mode == "to-disk"
+      tags: [install]
+
+    - name: Validate target disk was found
+      ansible.builtin.assert:
+        that:
+          - resolved_disk | length > 0
+        fail_msg: >
+          Could not find a disk matching type "{{ bootc_install_disk }}".
+          Available disks: run 'lsblk -dno NAME,TYPE,SIZE' on the target.
+      when: bootc_install_mode == "to-disk"
+      tags: [install]
+
+    - name: Display install mode
+      ansible.builtin.debug:
+        msg: >
+          Install mode: {{ bootc_install_mode }}
+          {% if bootc_install_mode == 'to-disk' %}Target disk: {{ resolved_disk }}{% endif %}
+      tags: [install]
+
+    #=========================================================================
+    # Step 5b: Pre-checks
+    #=========================================================================
+    - name: Check if target disk contains running root filesystem
+      ansible.builtin.shell: |
+        ROOT_DISK=$(lsblk -nso NAME,TYPE $(findmnt -n -o SOURCE /) 2>/dev/null | awk '$2=="disk"{print $1; exit}')
+        TARGET_BASE=$(basename "{{ resolved_disk }}")
+        if [ "$ROOT_DISK" = "$TARGET_BASE" ]; then
+          echo "CONFLICT"
+        else
+          echo "OK"
+        fi
+      register: root_disk_check
+      changed_when: false
+      when: bootc_install_mode == "to-disk"
+      tags: [install]
+
+    - name: Fail if target disk contains running root
+      ansible.builtin.assert:
+        that:
+          - root_disk_check.stdout | trim != "CONFLICT"
+        fail_msg: >
+          Cannot wipe {{ resolved_disk }} — it contains the running root filesystem (/).
+          Use bootc_install_mode=existing-root to install in-place,
+          or target a different disk with bootc_install_disk=<type>.
+      when: bootc_install_mode == "to-disk"
+      tags: [install]
+
+    - name: Verify ESP and root are on the same disk (existing-root safety check)
+      ansible.builtin.shell: |
+        ESP_DISK=$(lsblk -nso NAME,TYPE $(findmnt -n -o SOURCE /boot/efi 2>/dev/null) 2>/dev/null | awk '$2=="disk"{print $1; exit}')
+        ROOT_DISK=$(lsblk -nso NAME,TYPE $(findmnt -n -o SOURCE /) 2>/dev/null | awk '$2=="disk"{print $1; exit}')
+        if [ -z "$ESP_DISK" ] || [ -z "$ROOT_DISK" ]; then
+          echo "UNKNOWN"
+        elif [ "$ESP_DISK" = "$ROOT_DISK" ]; then
+          echo "OK"
+        else
+          echo "SPLIT:$ESP_DISK:$ROOT_DISK"
+        fi
+      register: esp_root_check
+      changed_when: false
+      when: bootc_install_mode == "existing-root"
+      tags: [install]
+
+    - name: Warn if ESP and root are on different disks
+      ansible.builtin.debug:
+        msg: >
+          WARNING: ESP is on /dev/{{ esp_root_check.stdout.split(':')[1] }}
+          but root is on /dev/{{ esp_root_check.stdout.split(':')[2] }}.
+          bootc to-existing-root requires them on the same device.
+          If install fails, re-provision with the NVMe kickstart or use to-disk mode.
+      when:
+        - bootc_install_mode == "existing-root"
+        - esp_root_check.stdout is defined
+        - esp_root_check.stdout | trim is match("SPLIT:.*")
+      tags: [install]
+
+    #=========================================================================
+    # Step 5c: Verify target disk is safe to wipe (to-disk mode only)
+    #=========================================================================
+    - name: Check if target disk has LVM physical volumes
+      ansible.builtin.shell: pvs --noheadings -o pv_name 2>/dev/null | grep "$(basename {{ resolved_disk }})" | tr -d ' '
+      register: disk_pvs
+      changed_when: false
+      failed_when: false
+      when: bootc_install_mode == "to-disk"
+      tags: [install]
+
+    - name: Fail if target disk is part of an active LVM VG
+      ansible.builtin.assert:
+        that:
+          - disk_pvs.stdout | trim | length == 0
+        fail_msg: >
+          UNSAFE: {{ resolved_disk }} has active LVM physical volumes: {{ disk_pvs.stdout_lines | join(', ') }}.
+          Removing a PV from a shared VG corrupts LVs that span multiple disks and causes emergency mode on reboot.
+          Use bootc_install_mode=existing-root instead, or re-provision with the NVMe kickstart
+          (reserve_jetson.py without --no-kickstart) so the OS uses a single disk.
+      when:
+        - bootc_install_mode == "to-disk"
+        - disk_pvs.stdout is defined
+      tags: [install]
+
+    - name: Unmount non-LVM filesystems on target disk
+      ansible.builtin.shell: |
+        DISK_BASE=$(basename "{{ resolved_disk }}")
+        mount | grep "$DISK_BASE" | awk '{print $3}' | sort -r | while read mp; do
+          umount -l "$mp" 2>/dev/null || true
+        done
+        sync
+      changed_when: true
+      failed_when: false
+      when: bootc_install_mode == "to-disk"
+      tags: [install]
+
+    #=========================================================================
+    # Step 5d: Run bootc install
     #=========================================================================
     - name: Run bootc install to-existing-root
       ansible.builtin.command:
@@ -150,92 +294,114 @@
       register: bootc_install
       async: 2400
       poll: 15
+      when: bootc_install_mode == "existing-root"
       tags: [install]
-    
+
+    - name: Run bootc install to-disk
+      ansible.builtin.command:
+        cmd: >
+          podman run --rm --privileged
+          -v /dev:/dev
+          -v /var/lib/containers:/var/lib/containers
+          -v /root/.ssh/authorized_keys:/authorized_keys:ro
+          --pid=host --security-opt label=type:unconfined_t
+          {{ bootc_image }}
+          bootc install to-disk {{ resolved_disk }}
+          --wipe
+          --root-ssh-authorized-keys=/authorized_keys
+          --skip-fetch-check
+      register: bootc_install
+      async: 2400
+      poll: 15
+      when: bootc_install_mode == "to-disk"
+      tags: [install]
+
     - name: Display bootc install output
       ansible.builtin.debug:
         var: bootc_install.stdout_lines
       tags: [install]
     
     #=========================================================================
-    # Step 6: Find EFI device
-    #=========================================================================
-    - name: Get EFI mount device
-      ansible.builtin.command: findmnt -n -o SOURCE /boot/efi
-      register: efi_mount
-      changed_when: false
-      tags: [efi]
-    
-    - name: Set EFI partition device
-      ansible.builtin.set_fact:
-        efi_partition: "{{ efi_mount.stdout | trim | basename }}"
-      tags: [efi]
-    
-    - name: Determine EFI disk from partition
-      ansible.builtin.set_fact:
-        efi_disk: "{{ efi_partition | regex_replace('p?\\d+$', '') }}"
-      tags: [efi]
-    
-    - name: Display EFI device info
-      ansible.builtin.debug:
-        msg: "EFI partition: {{ efi_partition }}, disk: /dev/{{ efi_disk }}"
-      tags: [efi]
-    
-    #=========================================================================
-    # Step 7: Create EFI boot entry on correct device (mmcblk0 for Jetson)
-    # Note: bootc install may create entries on nvme, but /boot/efi is on mmcblk0
+    # Step 6-7: Create EFI boot entry on target disk (to-disk mode only)
+    # to-existing-root uses the existing EFI partition in place.
+    # to-disk creates its own ESP on the target disk — we delete any
+    # stale bootc entries and create one pointing to the target.
     #=========================================================================
     - name: Check current EFI entries after bootc install
       ansible.builtin.command: efibootmgr
       register: current_efi
       changed_when: false
+      when: bootc_install_mode == "to-disk"
       tags: [efi]
-    
+
     - name: Find any bootc entries (may be on wrong device)
       ansible.builtin.set_fact:
         existing_bootc_entries: "{{ current_efi.stdout | regex_findall('Boot([0-9A-Fa-f]{4})\\*.*bootc', ignorecase=True) }}"
+      when: bootc_install_mode == "to-disk"
       tags: [efi]
-    
+
     - name: Delete existing bootc entries (may point to wrong device)
       ansible.builtin.command: "efibootmgr -b {{ item }} -B"
       loop: "{{ existing_bootc_entries }}"
-      when: existing_bootc_entries | length > 0
+      when:
+        - bootc_install_mode == "to-disk"
+        - existing_bootc_entries | length > 0
       failed_when: false
       tags: [efi]
-    
-    - name: Create EFI boot entry on correct device ({{ efi_disk }})
+
+    - name: Create EFI boot entry pointing to target disk ({{ resolved_disk }})
       ansible.builtin.command:
         cmd: >
           efibootmgr --create
-          --disk /dev/{{ efi_disk }}
+          --disk {{ resolved_disk }}
           --part 1
           --label "{{ boot_label }}"
           --loader "\EFI\redhat\shimaa64.efi"
       register: efi_create
+      when: bootc_install_mode == "to-disk"
       tags: [efi]
-    
+
     - name: Get new EFI boot configuration
       ansible.builtin.command: efibootmgr
       register: new_efi_info
       changed_when: false
+      when: bootc_install_mode == "to-disk"
       tags: [efi]
-    
+
     - name: Find the new bootc entry
       ansible.builtin.set_fact:
         bootc_entries: "{{ new_efi_info.stdout | regex_findall('Boot([0-9A-Fa-f]{4})\\*.*bootc', ignorecase=True) }}"
+      when: bootc_install_mode == "to-disk"
       tags: [efi]
-    
+
+    - name: Set empty bootc_entries for existing-root mode
+      ansible.builtin.set_fact:
+        bootc_entries: []
+      when: bootc_install_mode == "existing-root"
+      tags: [efi]
+
     - name: Display boot configuration
       ansible.builtin.debug:
         msg: |
-          EFI device: /dev/{{ efi_disk }} ({{ efi_partition }})
-          Bootc entry: {{ bootc_entries | join(', ') }}
-          Boot order will be set with PXE ({{ pxe_entry }}) first
+          {% if bootc_install_mode == 'to-disk' %}
+          Target disk: {{ resolved_disk }}
+          Bootc EFI entry: {{ bootc_entries | join(', ') }}
+          Next boot: bootc (one-shot), then PXE first
+          {% else %}
+          Install mode: existing-root (EFI handled in-place by bootc)
+          {% endif %}
       tags: [efi]
     
     #=========================================================================
-    # Step 9: Reboot to new image
+    # Step 9: Set boot order and reboot to new image
     #=========================================================================
+    - name: Set bootc as next boot (one-shot) for to-disk mode
+      ansible.builtin.command: "efibootmgr -n {{ bootc_entries | first }}"
+      when:
+        - bootc_install_mode == "to-disk"
+        - bootc_entries | length > 0
+      tags: [reboot]
+
     - name: Reboot to bootc image
       ansible.builtin.reboot:
         reboot_timeout: 600
@@ -344,12 +510,28 @@
       tags: [verify]
 
     #=========================================================================
-    # Step 12: Restore original boot order (PXE first)
+    # Step 12: Restore original boot order (PXE first, EFI shell second)
     #   Skip with: -e "restore_boot_order=false"
+    #   For to-disk mode: keep bootc entry (needed for future boots),
+    #     put PXE first so Beaker reservations work
+    #   For existing-root mode: delete bootc entry (not needed, OS boots
+    #     via the original EFI entry)
     #=========================================================================
-    - name: Calculate PXE-first boot order
+    - name: Calculate PXE-first boot order (keeping bootc entry for to-disk)
       ansible.builtin.set_fact:
-        pxe_first_order: "{{ ([pxe_entry] + (original_boot_order.split(',') | reject('in', bootc_entries) | reject('eq', pxe_entry) | list)) | join(',') }}"
+        pxe_first_order: >-
+          {{ ([pxe_entry] +
+              (original_boot_order.split(',') | reject('eq', pxe_entry) | list) +
+              (bootc_entries | difference(original_boot_order.split(',')))) | join(',') }}
+      when: bootc_install_mode == "to-disk"
+      tags: [restore]
+
+    - name: Calculate PXE-first boot order (existing-root)
+      ansible.builtin.set_fact:
+        pxe_first_order: >-
+          {{ ([pxe_entry] +
+              (original_boot_order.split(',') | reject('in', bootc_entries) | reject('eq', pxe_entry) | list)) | join(',') }}
+      when: bootc_install_mode == "existing-root"
       tags: [restore]
 
     - name: Restore original boot order (PXE first)
@@ -357,11 +539,12 @@
       when: restore_boot_order | bool
       tags: [restore]
 
-    - name: Delete bootc EFI entries
+    - name: Delete bootc EFI entries (existing-root only)
       ansible.builtin.command: "efibootmgr -b {{ item }} -B"
       loop: "{{ bootc_entries }}"
       when:
         - restore_boot_order | bool
+        - bootc_install_mode == "existing-root"
         - bootc_entries | length > 0
       failed_when: false
       tags: [restore]
@@ -378,7 +561,11 @@
           {% if restore_boot_order | bool %}
           Boot order RESTORED to PXE-first:
             Order: {{ pxe_first_order }}
+          {% if bootc_install_mode == 'existing-root' %}
             Deleted bootc entries: {{ bootc_entries | join(', ') }}
+          {% else %}
+            Kept bootc entries: {{ bootc_entries | join(', ') }} (needed for future boots)
+          {% endif %}
           {% else %}
           Boot order NOT restored (restore_boot_order=false)
             To restore later run:

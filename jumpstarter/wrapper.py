@@ -6,6 +6,7 @@ import sys
 import os
 import re
 import yaml
+import contextlib
 import subprocess
 from pathlib import Path
 from logging import getLogger
@@ -197,12 +198,14 @@ def _fix_efi_via_serial(p):
     p.expect_exact("WRAPPER_EFI_LIST_OK", timeout=30)
     logger.info("[wrapper] Current EFI entries:\n%s", p.before)
 
-    # Remove ALL OS-related boot entries (Red Hat, RHEL, Bootc, Jumpstarter, shim)
+    # Remove ALL OS-related and PXE/network boot entries
     # Do NOT create any new entries — rely on hardware USB fallback
     # Filter with '^Boot[0-9]' first to exclude BootCurrent/BootOrder info lines
+    # PXE/network entries cause the device to boot from Beaker PXE server
+    # instead of USB, ending up at UEFI Shell
     remove_cmd = (
         "for num in $(efibootmgr | grep '^Boot[0-9]' "
-        "| grep -iE 'Red Hat|RHEL|Bootc|Jumpstarter|shim|redhat' "
+        "| grep -iE 'Red Hat|RHEL|Bootc|Jumpstarter|shim|redhat|PXE|Network|IPv4|IPv6|HTTP|EFI Network' "
         "| awk '{print substr($1,5,4)}'); "
         "do echo \"Removing Boot$num\"; efibootmgr -b $num -B 2>/dev/null; done "
         "&& echo WRAPPER_EFI_REMOVE_OK"
@@ -234,6 +237,73 @@ def _fix_efi_via_serial(p):
     p.sendline("exit")
     time.sleep(2)
     logger.info("[wrapper] EFI boot fix complete, will re-flash and retry boot from USB")
+
+
+def _pin_usb_boot_first(p):
+    """Make the firmware deterministically boot the flashed USB image on every
+    subsequent power-on (the 'always USB' fix).
+
+    Background (agx-orin-11, see .claude/memory/jumpstarter-errors.md 2026-09-06):
+    every flash appends a new "Red Hat Enterprise Linux" UEFI boot entry and old
+    ones are never cleaned up (80+ stale duplicates observed, all pointing at
+    dead/old UUIDs or the internal eMMC). Which one the firmware puts first in
+    BootOrder varies per flash, so the device intermittently boots the STALE
+    internal eMMC RHEL — which hangs in early kernel init and never reaches
+    login — instead of the freshly flashed USB image. (It also risks filling
+    UEFI NVRAM -> the "Volume Full" boot-loop seen on nx-orin-01.)
+
+    This must be called ONLY once we have a root shell on the correctly-booted
+    USB image. Because the stale eMMC install hangs *before* login, simply
+    reaching a login/root shell guarantees we are on the USB image, so
+    `BootCurrent` is the good USB boot entry. We:
+      1. pin BootCurrent first in BootOrder, and
+      2. delete every other stale RHEL/PXE/Network entry (keeping BootCurrent),
+    so the next boot (bootc firstboot reboots, later test phases, and subsequent
+    runs until the next reflash) is deterministic.
+
+    Assumes the caller is already logged in as root at a shell prompt (`#`).
+    Runs as a SINGLE compound command — multiple dependent sendlines interleave
+    on the shared serial console (console=ttyTCU0).
+    """
+    logger.info("[wrapper] Pinning USB boot entry first + pruning stale EFI entries...")
+    pin_cmd = (
+        "dmesg -n 1; "
+        # Build the marker from a shell var so the literal 'WRAPPER_PIN_OK'
+        # appears only in the command OUTPUT, never in its echo. Otherwise
+        # p.expect_exact() matches the echoed command and returns BEFORE the
+        # command finishes, letting the next sendline interleave with it and
+        # corrupt the following SSH-config step (serial rule).
+        "PMARK=WRAPPER_PIN; "
+        "BC=$(efibootmgr | awk '/^BootCurrent:/{print $2}'); "
+        "if [ -n \"$BC\" ]; then "
+        # grep -E '^Boot[0-9A-Fa-f]{4}' (require 4 hex) so we match real boot
+        # entries only, NOT the 'BootCurrent:'/'BootOrder:' info lines
+        # ('BootCurrent' -> 'Curr' would otherwise slip through and yield a
+        # bogus 'efibootmgr -b Curr -B'). See serial rules in memory.
+        "for n in $(efibootmgr | grep -E '^Boot[0-9A-Fa-f]{4}' "
+        "| grep -iE 'Red Hat|RHEL|Bootc|shim|redhat|PXE|Network|IPv4|IPv6|HTTP|EFI Network' "
+        "| awk '{print substr($1,5,4)}'); do "
+        "[ \"$n\" != \"$BC\" ] && efibootmgr -b \"$n\" -B >/dev/null 2>&1; "
+        "done; "
+        "O=$(efibootmgr | awk '/^BootOrder:/{print $2}'); "
+        "R=$(echo \"$O\" | sed \"s/$BC,//g; s/,$BC//g; s/^$BC$//\"); "
+        "efibootmgr -o \"$BC${R:+,$R}\" >/dev/null 2>&1; "
+        "echo ${PMARK}_OK BC=$BC; "
+        "else echo ${PMARK}_SKIP_NO_BOOTCURRENT; fi"
+    )
+    p.sendline(pin_cmd)
+    try:
+        idx = p.expect_exact(
+            ["WRAPPER_PIN_OK", "WRAPPER_PIN_SKIP_NO_BOOTCURRENT"], timeout=60
+        )
+        if idx == 0:
+            logger.info("[wrapper] USB boot entry pinned first; stale EFI entries pruned")
+        else:
+            logger.warning("[wrapper] Could not read BootCurrent — skipped EFI pin (non-fatal)")
+    except Exception:
+        # Non-fatal: the current boot already succeeded; pinning only helps
+        # future boots. Don't fail the run if the serial marker is missed.
+        logger.warning("[wrapper] EFI pin marker not seen — continuing (non-fatal)")
 
 
 def _handle_emergency(p):
@@ -308,8 +378,42 @@ def _handle_emergency(p):
     return False
 
 
+def _try_efi_shell_boot(p):
+    """Try to boot directly from UEFI Shell by finding BOOTAA64.EFI on USB filesystem.
+
+    When PXE boot hijacks the boot order, the UEFI boot manager keeps looping
+    through PXE. Instead of returning to the boot manager (exit), we boot the
+    USB's EFI bootloader directly from the Shell prompt.
+
+    Returns True if login prompt was reached after booting, False otherwise.
+    """
+    logger.info("[wrapper] Refreshing UEFI device map...")
+    p.sendline("map -r")
+    time.sleep(5)
+
+    for fs in ["FS0", "FS1", "FS2", "FS3", "FS4", "FS5", "FS6", "FS7"]:
+        logger.info("[wrapper] Trying %s:\\EFI\\BOOT\\BOOTAA64.EFI ...", fs)
+        p.sendline(f"{fs}:\\EFI\\BOOT\\BOOTAA64.EFI")
+        try:
+            idx = p.expect_exact(["login:", "Shell>", "is not recognized", "not found",
+                                  "Cannot find", "Give root password"], timeout=60)
+            if idx == 0:
+                logger.info("[wrapper] Booted from %s — got login prompt!", fs)
+                return True
+            elif idx == 5:
+                logger.info("[wrapper] Booted from %s — emergency mode", fs)
+                return True
+            else:
+                logger.info("[wrapper] %s: not bootable (idx=%d), trying next...", fs, idx)
+        except Exception:
+            logger.info("[wrapper] %s: timeout or error, trying next...", fs)
+
+    logger.info("[wrapper] Could not find BOOTAA64.EFI on any filesystem")
+    return False
+
+
 def _wait_for_login(p):
-    """Wait for login: prompt, handling grub>, dutlink, and emergency mode recovery.
+    """Wait for login: prompt, handling grub>, UEFI Shell, PXE GRUB menu, dutlink, and emergency mode.
 
     Returns True if login prompt was reached, False otherwise.
     Raises RuntimeError if emergency mode password login fails.
@@ -317,7 +421,10 @@ def _wait_for_login(p):
     got_login = False
     for attempt in range(3):
         try:
-            idx = p.expect_exact(["login:", "grub>", "Give root password"], timeout=600)
+            idx = p.expect_exact(
+                ["login:", "grub>", "Give root password", "Shell>", "Use the ^ and v keys", "Enter to continue boot."],
+                timeout=600,
+            )
             if idx == 0:
                 got_login = True
                 break
@@ -330,13 +437,56 @@ def _wait_for_login(p):
                 if _handle_emergency(p):
                     got_login = True
                     break
+            elif idx == 3:
+                logger.info(
+                    f"\n[wrapper] UEFI Shell detected (attempt {attempt + 1}/3). "
+                    "Waiting 60s for boot to settle, then checking for login..."
+                )
+                time.sleep(60)
+                p.sendline("")
+                try:
+                    idx2 = p.expect_exact(["login:", "Shell>", "Give root password"], timeout=10)
+                    if idx2 == 0:
+                        logger.info("[wrapper] Login prompt appeared after wait — device booted!")
+                        got_login = True
+                        break
+                    elif idx2 == 2:
+                        logger.info("[wrapper] Emergency mode after wait")
+                        if _handle_emergency(p):
+                            got_login = True
+                            break
+                    elif idx2 == 1:
+                        logger.info("[wrapper] Still at Shell> — PXE boot order issue. Trying direct EFI boot...")
+                        if _try_efi_shell_boot(p):
+                            got_login = True
+                            break
+                except Exception:
+                    logger.info("[wrapper] No prompt after wait, trying direct EFI boot from Shell...")
+                    p.sendline("")
+                    try:
+                        p.expect_exact("Shell>", timeout=10)
+                        if _try_efi_shell_boot(p):
+                            got_login = True
+                            break
+                    except Exception:
+                        logger.info("[wrapper] Lost Shell> prompt, will retry...")
+            elif idx == 4:
+                logger.info("[wrapper] GRUB boot menu detected, sending ENTER to boot default entry...")
+                p.sendline("")
+                time.sleep(5)
+                continue
+            elif idx == 5:
+                logger.info("[wrapper] UEFI boot screen detected, sending ENTER to continue boot...")
+                p.sendline("")
+                time.sleep(5)
+                continue
         except RuntimeError:
             raise  # don't swallow RuntimeError from _handle_emergency
         except Exception:
             logger.info(f"\n[wrapper] Timeout waiting for login/grub (attempt {attempt + 1}/3), sending ENTER to probe for dutlink shell...")
             p.sendline("")
             try:
-                idx = p.expect_exact(["#>", "login:", "grub>"], timeout=30)
+                idx = p.expect_exact(["#>", "login:", "grub>", "Shell>"], timeout=30)
                 if idx == 0:
                     logger.info("[wrapper] Detected dutlink internal shell (#>), sending 'console' to re-enter serial console...")
                     p.sendline("console")
@@ -348,6 +498,11 @@ def _wait_for_login(p):
                     logger.info("[wrapper] Got grub> after probe, sending 'exit'...")
                     p.sendline("exit")
                     time.sleep(10)
+                elif idx == 3:
+                    logger.info("[wrapper] Got Shell> after probe, trying direct EFI boot...")
+                    if _try_efi_shell_boot(p):
+                        got_login = True
+                        break
             except Exception:
                 logger.info("[wrapper] No recognizable prompt after probe, retrying...")
 
@@ -355,7 +510,15 @@ def _wait_for_login(p):
 
 
 with env() as client:
-    with client.log_stream():
+    # NOTE: Do NOT wrap this in `client.log_stream()`. log_stream() opens a
+    # second, passive consumer of the serial stream that races the interactive
+    # `client.serial.pexpect()` reader opened below. The serial driver delivers
+    # each byte to only one reader, so log_stream() intermittently swallows boot
+    # output (including the `login:` prompt) before pexpect can match it —
+    # causing _wait_for_login() to time out even though the device booted fine.
+    # pexpect still mirrors live serial to stdout via `p.logfile`, so we lose no
+    # visibility. See .claude/memory/jumpstarter-errors.md (2026-09-06).
+    with contextlib.nullcontext():
 
         # When emergency mode can't be resolved via password+exit, skip storage.dut()
         # on the next attempt so the device boots from NVMe. The wrong OS detection
@@ -452,8 +615,20 @@ with env() as client:
                         p.sendline(PASSWORD)
                         p.expect(r"[#\$]", timeout=30)
 
+                        # Reaching a root shell means we booted the flashed USB
+                        # image (the stale internal eMMC install hangs before
+                        # login), so BootCurrent is the good USB entry. Pin it
+                        # first + prune stale duplicates so future boots are
+                        # deterministic ('always USB'). Non-fatal on failure.
+                        _pin_usb_boot_first(p)
+
                         p.sendline(
                             "echo 'PermitRootLogin yes' > /etc/ssh/sshd_config.d/01-permitrootlogin.conf"
+                            # Also enable password auth: reaching login proves the
+                            # root password is valid, but the image may ship
+                            # PasswordAuthentication no, which blocks the paramiko
+                            # root-password SSH used by the growpart/prepull steps.
+                            " && echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config.d/01-permitrootlogin.conf"
                             " && chmod 644 /etc/ssh/sshd_config.d/01-permitrootlogin.conf"
                             " && systemctl restart sshd"
                             " && echo WRAPPER_SSH_CONFIG_OK"
@@ -519,4 +694,8 @@ with env() as client:
                   f"JETSON_PORT={os.environ['JETSON_PORT']} "
                   f"JETSON_USERNAME={os.environ.get('JETSON_USERNAME')} "
                   f"JETSON_KEY_PATH={os.environ.get('JETSON_KEY_PATH', '(not set)')}")
-            subprocess.run(sys.argv[1:])
+            result = subprocess.run(sys.argv[1:])
+            # Propagate pytest's exit code so CI (Testing Farm / Konflux) sees
+            # real failures. Without this the wrapper always exits 0 and every
+            # run is reported PASSED regardless of failed/errored tests.
+            sys.exit(result.returncode)

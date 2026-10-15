@@ -6,6 +6,7 @@ This ensures the modules will load correctly when Secure Boot is enabled.
 """
 import pytest
 from logging import getLogger
+from tests_suites import conftest as _conftest
 logger = getLogger(__name__)
 
 NVIDIA_KERNEL_MODULES = [
@@ -28,6 +29,9 @@ class TestKernelModuleSignatures:
         - signer: Should be "Nvidia GPU OOT CA"
         - sig_hashalgo: sha256 (or stronger)
         """
+        if _conftest.IS_STAGE_BUILD:
+            pytest.skip("Stage/Dev/Sidecar build — kernel modules may not be signed with production keys")
+
         unsigned_modules = []
         signed_modules = []
         missing_modules = []
@@ -75,6 +79,9 @@ class TestKernelModuleSignatures:
         - Signed by NVIDIA (Nvidia GPU OOT CA)
         - Uses SHA256 or stronger hash algorithm
         """
+        if _conftest.IS_STAGE_BUILD:
+            pytest.skip("Stage/Dev/Sidecar build — signature details verification skipped")
+
         result = ssh.run("modinfo nvgpu  | grep -E '^(signer|sig_id|sig_hashalgo):'", fail_on_rc=False)
 
         if result.exit_status != 0:

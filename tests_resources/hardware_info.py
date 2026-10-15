@@ -119,41 +119,46 @@ def get_l4t_version(ssh) -> Optional[Union[float, str]]:
 
 
 def get_jetpack_userspace_version(ssh) -> Optional[str]:
-    """Return JetPack userspace RPM version (e.g. '6.2.2' or '7.2') from nvidia-jetpack-*-core RPM."""
-    rpm_output = _run(ssh, "rpm -qa | grep 'nvidia-jetpack.*core'")
-    if not rpm_output:
-        return None
-    match = re.search(r"core-(\d+\.\d+(?:\.\d+)?)", rpm_output)
-    return match.group(1) if match else None
+    """Return JetPack userspace RPM version (e.g. '6.2.2') from nvidia-jetpack-for-rhel-*-core RPM."""
+    return get_all_jetpack_rpm_versions(ssh).get("core")
+
+
+def get_jetpack_kmod_version(ssh) -> Optional[str]:
+    """Return JetPack kmod RPM version (e.g. '6.2.2') from nvidia-jetpack-for-rhel-*-kmod RPM."""
+    return get_all_jetpack_rpm_versions(ssh).get("kmod")
+
+
+def get_all_jetpack_rpm_versions(ssh) -> dict[str, str]:
+    """Return dict of {component: version} for all nvidia-jetpack RPMs."""
+    output = _run(ssh, "rpm -qa --qf '%{NAME} %{VERSION}\\n' | grep nvidia-jetpack")
+    if not output:
+        return {}
+    versions = {}
+    for line in output.strip().splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        name, version = parts
+        # Strip common prefixes to extract component name (e.g. 'core', 'kmod', 'all')
+        comp = name
+        if comp.startswith("nvidia-jetpack-for-rhel"):
+            # nvidia-jetpack-for-rhel-9.7-core -> core
+            comp = re.sub(r"^nvidia-jetpack-for-rhel-[\d.]+-?", "", comp)
+        elif comp.startswith("nvidia-jetpack"):
+            # nvidia-jetpack-core -> core
+            comp = re.sub(r"^nvidia-jetpack-?", "", comp)
+
+        # Truncate version string at first '~' or '-' to match testing matrix (e.g. 36.5.0)
+        clean_version = version.split('~')[0].split('-')[0]
+        versions[comp] = clean_version
+    return versions
 
 
 # Backward-compat alias: get_jetpack_version now returns userspace RPM version
 get_jetpack_version = get_jetpack_userspace_version
 
 
-def get_jetpack_kmod_version(ssh) -> Optional[str]:
-    """Return JetPack kmod RPM version (e.g. '6.2.2' or '7.2') from nvidia-jetpack-*-kmod RPM."""
-    rpm_output = _run(ssh, "rpm -qa | grep 'nvidia-jetpack.*kmod'")
-    if not rpm_output:
-        return None
-    match = re.search(r"kmod-(\d+\.\d+(?:\.\d+)?)", rpm_output)
-    return match.group(1) if match else None
-
-
-def get_all_jetpack_rpm_versions(ssh) -> dict[str, str]:
-    """Return dict of {component: version} for all nvidia-jetpack RPMs."""
-    output = _run(ssh, "rpm -qa | grep nvidia-jetpack | sort")
-    if not output:
-        return {}
-    versions = {}
-    for line in output.strip().splitlines():
-        match = re.search(r"nvidia-jetpack-for-rhel-[\d.]+-([a-z][a-z0-9-]*)-(\d+\.\d+(?:\.\d+)?)", line)
-        if match:
-            versions[match.group(1)] = match.group(2)
-    return versions
-
-
-def compare_versions(actual: Optional[Union[float, str]], target) -> bool:
+def compare_versions(actual: Optional[Union[float, str]], target: Optional[str]) -> bool:
     """Exact version comparison. Converts both to strings.
     For kernel versions (target contains '-'): uses prefix match.
     If target is a list, returns True if actual matches any entry.

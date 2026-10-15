@@ -12,6 +12,14 @@
 # -----------------------------------------------------------------------------
 _target_versions:
 
+  "7.2.1":
+    rhel_version: "10.2"
+    l4t_version: "39.2.0"
+    uefi_firmware_version:
+      - "39.2.0"
+    kernel_version:
+      - "6.12.0-211.50.1"
+
   "7.2.0":
     rhel_version: "10.2"
     l4t_version: "39.2.0"

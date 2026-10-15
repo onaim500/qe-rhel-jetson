@@ -16,9 +16,15 @@
 #   ansible-playbook -i inventory.yml install_bootc.yml --ask-vault-pass \
 #     -e "reservation_hours=24"
 #
-#  # Override bootc_image_base: 
+#  # Override bootc_image_base:
 #   ansible-playbook -i inventory.yml install_bootc.yml --ask-vault-pass \
 #     -e "bootc_image_base=registry.gitlab.com/redhat/rhel/sst/orin-sidecar/nvidia-jetson-sidecar/rhel-9.7"
+#
+#   # Install to a specific disk (to-disk mode):
+#   ansible-playbook -i inventory.yml install_bootc.yml --ask-vault-pass \
+#     -e "bootc_install_mode=to-disk" -e "bootc_install_disk=nvme"
+#
+#   # Disk types: "nvme", "emmc", "sd", "usb", or explicit path "/dev/nvme0n1"
 #
 # Usage (JetPack RPMs):
 #   # Basic usage with subscription credentials
@@ -65,6 +71,11 @@ all:
     reservation_hours: 24
     boot_restore_hours: "{{ (reservation_hours | default(24) | int) - 2 }}"
     boot_label: "Red Hat Enterprise Linux bootc"
+
+    # bootc install mode: "existing-root" (default) or "to-disk"
+    bootc_install_mode: "existing-root"
+    # Target disk for to-disk mode: "nvme", "emmc", "sd", "usb", or explicit path
+    bootc_install_disk: ""
 
     # JetPack RPM Installation defaults
     jetpack_repo_url: "http://hwcert-vm-repo-01.lab.eng.rdu2.redhat.com/packages/RHEL9/nvidia-jetpack/nvidia-jetpack-el9.repo"

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -u
 """
 Reserve a Jetson system via Beaker.
 
@@ -44,13 +44,13 @@ SSH_RETRY_INTERVAL = 30  # seconds
 
 # Job XML template
 JOB_XML_TEMPLATE = '''<job retention_tag="scratch">
-  <whiteboard>Jetson Bootc Testing - {target_short}</whiteboard>
+  <whiteboard>Reserve Workflow provision of distro {distro} on {target_short} for {reserve_seconds} seconds</whiteboard>
   <recipeSet priority="High">
-    <recipe whiteboard="" role="RECIPE_MEMBERS" ks_meta="" kernel_options="" kernel_options_post="">
+    <recipe whiteboard="" role="RECIPE_MEMBERS" ks_meta="{ks_meta}" kernel_options="" kernel_options_post="">
       <autopick random="false"/>
       <watchdog panic="ignore"/>
       <packages/>
-      <ks_appends/>
+      {ks_appends}
       <repos/>
       <distroRequires>
         <and>
@@ -72,6 +72,59 @@ JOB_XML_TEMPLATE = '''<job retention_tag="scratch">
   </recipeSet>
 </job>'''
 
+KS_APPENDS_NVME = '''<ks_appends>
+        <ks_append><![CDATA[
+%pre --interpreter=/bin/bash
+# Pick the largest non-eMMC disk (NVMe on Jetsons) so ESP and root
+# land on the same device — required for bootc install to-existing-root.
+DISK=$(lsblk -dnbo NAME,SIZE,TYPE 2>/dev/null \\
+       | awk '$3=="disk" && $1 !~ /^mmcblk/ {{print $1, $2}}' \\
+       | sort -k2 -rn | head -1 | awk '{{print $1}}')
+[ -z "$DISK" ] && DISK=$(lsblk -dnbo NAME,SIZE,TYPE 2>/dev/null \\
+       | awk '$3=="disk" {{print $1, $2}}' \\
+       | sort -k2 -rn | head -1 | awk '{{print $1}}')
+cat > /tmp/partitions.ks <<EOF
+ignoredisk --only-use=$DISK
+clearpart --all --initlabel --disklabel=gpt --drives=$DISK
+reqpart --add-boot
+part / --grow --fstype xfs
+EOF
+%end
+
+%include /tmp/partitions.ks
+]]></ks_append>
+      </ks_appends>'''
+
+
+def normalize_distro_name(distro: str) -> str:
+    """Normalize distro name to match Beaker's naming convention.
+
+    RHEL 9 uses three-part versions: RHEL-9.7.0
+    RHEL 10+ uses two-part versions: RHEL-10.2
+    """
+    parts = distro.split("-", 1)
+    if len(parts) != 2:
+        return distro
+
+    prefix, version = parts
+    version_base = version.split("-updates")[0]
+    version_parts = version_base.split(".")
+
+    if len(version_parts) >= 2:
+        major = int(version_parts[0])
+        if major >= 10 and len(version_parts) == 3 and version_parts[2] == "0":
+            normalized = f"{prefix}-{version_parts[0]}.{version_parts[1]}"
+            if "-updates" in version:
+                normalized += version[version.index("-updates"):]
+            return normalized
+        elif major <= 9 and len(version_parts) == 2:
+            normalized = f"{prefix}-{version_base}.0"
+            if "-updates" in version:
+                normalized += version[version.index("-updates"):]
+            return normalized
+
+    return distro
+
 
 def resolve_distro(client: BeakerClient, distro: str) -> str:
     """Resolve a user-friendly distro name to one Beaker actually has.
@@ -80,56 +133,32 @@ def resolve_distro(client: BeakerClient, distro: str) -> str:
       - RHEL 9: "RHEL-9.7.0", "RHEL-9.8.0-updates-20260505.10"
       - RHEL 10: "RHEL-10.2", "RHEL-10.2-updates-20260713.1"
 
-    This function tries the exact name first, then progressively
-    shorter/simpler variants until one matches.
+    First normalizes the name based on known conventions, then verifies
+    against Beaker's REST API.
     """
-    import ssl
-    import xmlrpc.client
+    normalized = normalize_distro_name(distro)
+    if normalized != distro:
+        print(f"   Normalized distro name: {distro} → {normalized}")
 
-    hub_url = get_hub_url()
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    proxy = xmlrpc.client.ServerProxy(
-        hub_url + "/RPC2", allow_none=True, context=ctx,
-    )
-
-    # Build candidate list from most specific to least specific.
-    # e.g. "RHEL-10.2.0" -> try "RHEL-10.2.0", "RHEL-10.2", then wildcard search
-    candidates = [distro]
-    parts = distro.split("-", 1)
-    if len(parts) == 2:
-        version = parts[1]
-        # Strip trailing .0 -> "RHEL-10.2.0" becomes "RHEL-10.2"
-        if version.count(".") >= 2 and version.endswith(".0"):
-            candidates.append(f"RHEL-{version.rsplit('.', 1)[0]}")
+    candidates = [normalized]
+    if normalized != distro:
+        candidates.append(distro)
 
     for name in candidates:
         try:
-            results = proxy.distros.filter({"name": name})
-            if results:
-                print(f"   ✅ Distro resolved: {name}")
-                return name
+            response = client._request("GET", "/distros", params={"search": name, "page_size": 20})
+            data = response.json()
+            items = data.get("items", data.get("distros", []))
+            for item in items:
+                item_name = item.get("name", item.get("distro_name", ""))
+                if item_name == name:
+                    print(f"   ✅ Distro resolved: {item_name}")
+                    return item_name
         except Exception:
             pass
 
-    # Wildcard search: "RHEL-10.2.0" -> search "RHEL-10.2%"
-    base = distro.split("-updates")[0]  # strip "-updates-..." suffix
-    if base.count(".") >= 2 and base.endswith(".0"):
-        base = base.rsplit(".", 1)[0]  # "RHEL-10.2.0" -> "RHEL-10.2"
-    search_pattern = f"{base}%"
-    try:
-        results = proxy.distros.filter({"name": search_pattern})
-        if results:
-            best = results[0]
-            name = best.get("distro_name", best) if isinstance(best, dict) else str(best)
-            print(f"   ✅ Distro resolved via search: {name} (from pattern {search_pattern})")
-            return name
-    except Exception:
-        pass
-
-    print(f"   ⚠️  Could not resolve distro, using as-is: {distro}")
-    return distro
+    print(f"   ✅ Using normalized distro name: {normalized}")
+    return normalized
 
 
 def run_ssh_command(host: str, command: str, user: str = "root", timeout: int = 15) -> tuple[bool, str]:
@@ -257,8 +286,7 @@ def find_existing_job(client: BeakerClient, target: str, user: str) -> dict | No
         Job info dict if found, None otherwise
     """
     target_short = target.split(".")[0]
-    expected_whiteboard = f"Jetson Bootc Testing - {target_short}"
-    
+
     print(f"🔍 Checking for existing jobs for {target_short}...")
     
     try:
@@ -391,6 +419,11 @@ def main():
         action="store_true",
         help="Show job XML without submitting",
     )
+    parser.add_argument(
+        "--no-kickstart",
+        action="store_true",
+        help="Skip NVMe kickstart (let anaconda choose disk layout)",
+    )
     
     args = parser.parse_args()
     
@@ -410,14 +443,27 @@ def main():
 
         # Build job XML
         target_short = args.target.split(".")[0]
+        reserve_seconds = args.hours * 3600
         major = resolved_distro.split("-")[1].split(".")[0] if "-" in resolved_distro else "9"
         distro_family = f"RedHatEnterpriseLinux{major}"
+
+        if args.no_kickstart:
+            ks_meta = ""
+            ks_appends = "<ks_appends/>"
+            print("   ⏭️  Kickstart disabled (anaconda default disk layout)")
+        else:
+            ks_meta = "no_autopart"
+            ks_appends = KS_APPENDS_NVME
+            print("   ✅ NVMe kickstart enabled (ESP+root on same disk)")
+
         job_xml = JOB_XML_TEMPLATE.format(
             target=args.target,
             target_short=target_short,
             distro=resolved_distro,
             distro_family=distro_family,
-            reserve_seconds=args.hours * 3600,
+            reserve_seconds=reserve_seconds,
+            ks_meta=ks_meta,
+            ks_appends=ks_appends,
         )
 
         if args.dry_run:

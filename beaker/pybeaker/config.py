@@ -151,5 +151,5 @@ class BeakerConfig:
     @property
     def api_url(self) -> str:
         """Get the base API URL."""
-        return self.hub_url.rstrip("/")
+        return self.hub_url.rstrip("/") + "/bkr-api"
 

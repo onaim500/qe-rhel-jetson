@@ -211,7 +211,7 @@ class BeakerClient:
         self._session.auth = HTTPSPNEGOAuth()
         
         # Authenticate by hitting the login endpoint to get session cookie
-        login_url = f"{self.config.api_url}/login"
+        login_url = f"{self.config.hub_url}/login"
         response = self._session.get(login_url, allow_redirects=True)
         
         if response.status_code != 200:
@@ -223,10 +223,10 @@ class BeakerClient:
     
     def _url(self, path: str) -> str:
         """Build full URL from path."""
-        base = self.config.api_url
+        base = self.config.api_url.rstrip("/")
         if not path.startswith("/"):
             path = "/" + path
-        return urljoin(base, path)
+        return base + path
     
     def _request(
         self,
@@ -439,79 +439,30 @@ class BeakerClient:
             return None
     
     def submit_job(self, job_xml: str) -> str:
-        """Submit a job to Beaker via XML-RPC.
-        
+        """Submit a job to Beaker.
+
         Args:
             job_xml: Job XML string
-            
+
         Returns:
             Job ID (e.g., "J:12345")
         """
-        import html
-        import re
-        
-        # Use XML-RPC endpoint which works more reliably
-        # Escape the job XML for embedding in XML-RPC request
-        escaped_xml = html.escape(job_xml)
-        
-        rpc_body = f'''<?xml version="1.0"?>
-<methodCall>
-  <methodName>jobs.upload</methodName>
-  <params>
-    <param><value><string>{escaped_xml}</string></value></param>
-  </params>
-</methodCall>'''
-        
-        # Create a session without auth (use cookies from login)
-        rpc_session = requests.Session()
-        rpc_session.verify = self.config.ssl_verify
-        if hasattr(self, '_auth_cookies'):
-            rpc_session.cookies = self._auth_cookies
-        else:
-            rpc_session.cookies = self._session.cookies
-        
-        rpc_url = f"{self.config.api_url}/RPC2"
-        response = rpc_session.post(
-            rpc_url,
-            data=rpc_body,
-            headers={"Content-Type": "text/xml"},
-            timeout=self.config.timeout,
+        response = self._request(
+            "POST", "/jobs",
+            json={"ignore_missing_tasks": False, "xml": job_xml},
         )
-        
-        if response.status_code != 200:
-            raise BeakerError(f"Job submission failed: {response.status_code}")
-        
-        # Parse job ID from XML-RPC response
-        # Success: <value><string>J:12345</string></value>
-        # Fault: <faultString>...</faultString>
-        if '<fault>' in response.text:
-            fault_match = re.search(r'<faultString>.*?>(.*?)</string>', response.text)
-            error_msg = fault_match.group(1) if fault_match else response.text
-            raise BeakerError(f"Job submission failed: {error_msg}")
-        
-        job_match = re.search(r'<string>(J:\d+)</string>', response.text)
-        if job_match:
-            job_id = job_match.group(1)
-            numeric_id = job_id.replace("J:", "")
-            
-            # Verify the job exists and get basic info
-            try:
-                import time
-                time.sleep(0.5)  # Small delay for Beaker to process
-                
-                # Verify job exists by checking its status
-                status = self.get_job_status(job_id)
-                if status.status in ("Invalid", "Deleted"):
-                    raise BeakerError(f"Job {job_id} has invalid status: {status.status}")
-                    
-            except BeakerError:
-                raise
-            except Exception:
-                pass  # Verification failed but job ID was returned, continue
-            
-            return job_id
-        
-        raise BeakerError(f"Could not parse job ID from response: {response.text[:200]}")
+        data = response.json()
+
+        job_id = data.get("id") or data.get("t_id")
+        if not job_id:
+            raise BeakerError(f"Could not parse job ID from response: {data}")
+
+        if isinstance(job_id, int):
+            job_id = f"J:{job_id}"
+        elif not str(job_id).startswith("J:"):
+            job_id = f"J:{job_id}"
+
+        return job_id
     
     def get_job_status(self, job_id: str) -> JobStatus:
         """Get the status of a job.
@@ -543,110 +494,48 @@ class BeakerClient:
         limit: int = 25,
     ) -> list[JobStatus]:
         """List jobs.
-        
+
         Args:
             owner: Filter by owner username (default: current user)
             status: Filter by status (e.g., 'Running', 'Completed')
             limit: Maximum number of results
-            
+
         Returns:
             List of JobStatus objects
         """
-        # Use /jobs/mine for user's jobs (HTML parsing since API returns HTML)
-        url = "/jobs/mine" if not owner else "/jobs/"
-        
-        response = self._session.get(
-            f"{self.config.hub_url}{url}",
-            headers={"Accept": "text/html"},
-            verify=self.config.ssl_verify,
-        )
-        
+        params: dict[str, Any] = {"page": 1, "page_size": limit}
+        if owner:
+            params["owner"] = owner
+        if status:
+            params["status"] = status
+
+        response = self._request("GET", "/jobs", params=params)
+        data = response.json()
+
         jobs = []
-        seen_ids = set()
-        
-        # Parse job IDs from HTML
-        # Format: J:12345678
-        import re
-        
-        # Find all job IDs
-        job_ids = re.findall(r'J:(\d+)', response.text)
-        
-        for numeric_id in job_ids[:limit]:
-            if numeric_id in seen_ids:
-                continue
-            seen_ids.add(numeric_id)
-            
-            job_id = f"J:{numeric_id}"
-            
-            # Get status for each job
-            try:
-                status_obj = self.get_job_status(job_id)
-                
-                # Filter by status if requested
-                if status and status_obj.status != status:
-                    continue
-                    
-                jobs.append({
-                    "id": job_id,
-                    "status": status_obj.status,
-                    "result": status_obj.result,
-                    "whiteboard": status_obj.whiteboard,
-                })
-            except Exception:
-                # If we can't get status, add basic info
-                jobs.append({
-                    "id": job_id,
-                    "status": "Unknown",
-                    "result": None,
-                    "whiteboard": None,
-                })
-            
-            if len(jobs) >= limit:
-                break
-        
+        for item in data.get("items", []):
+            job_id = item.get("t_id") or f"J:{item.get('id', '')}"
+            jobs.append({
+                "id": job_id,
+                "status": item.get("status", "Unknown"),
+                "result": item.get("result"),
+                "whiteboard": item.get("whiteboard"),
+            })
+
         return jobs
     
     def cancel_job(self, job_id: str, message: str = "Cancelled via API") -> None:
-        """Cancel a job using XML-RPC.
-        
+        """Cancel a job.
+
         Args:
             job_id: Job ID (e.g., "J:12345" or "12345")
             message: Cancellation message
         """
-        # Extract numeric ID
         numeric_id = job_id.replace("J:", "") if job_id.startswith("J:") else job_id
-        taskactions_id = f"J:{numeric_id}"  # Format for taskactions.stop
-        
-        # Use XML-RPC to cancel the job
-        rpc_url = f"{self.config.hub_url}/RPC2"
-        
-        # Build XML-RPC request for taskactions.stop
-        # taskactions.stop(id, stop_type, msg) - id is "J:12345" format
-        rpc_body = f'''<?xml version="1.0"?>
-<methodCall>
-    <methodName>taskactions.stop</methodName>
-    <params>
-        <param><value><string>{taskactions_id}</string></value></param>
-        <param><value><string>cancel</string></value></param>
-        <param><value><string>{message}</string></value></param>
-    </params>
-</methodCall>'''
-        
-        response = self._session.post(
-            rpc_url,
-            data=rpc_body,
-            headers={"Content-Type": "text/xml"},
-            verify=self.config.ssl_verify,
-            timeout=self.config.timeout,
+        self._request(
+            "POST", f"/jobs/{numeric_id}/status",
+            json={"status": "Cancelled", "msg": message},
         )
-        
-        if response.status_code != 200:
-            raise BeakerError(f"Failed to cancel job: {response.status_code}")
-        
-        if '<fault>' in response.text:
-            fault_match = re.search(r'<faultString>.*?>(.*?)</string>', response.text)
-            error_msg = fault_match.group(1) if fault_match else response.text
-            raise BeakerError(f"Failed to cancel job: {error_msg}")
     
     def watch_job(
         self,
